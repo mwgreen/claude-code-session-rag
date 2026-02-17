@@ -1,0 +1,7 @@
+models/
+venv/
+*.pyc
+__pycache__/
+.session-rag/
+*.egg-info/
+mcp-config-template.json

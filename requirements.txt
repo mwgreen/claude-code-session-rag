@@ -1,0 +1,9 @@
+pymilvus[milvus-lite]>=2.6.0
+setuptools>=70.0,<82.0
+mlx>=0.30.0
+mlx-embeddings
+transformers<5.0
+mcp>=1.0.0
+starlette
+uvicorn
+httpx
