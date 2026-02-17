@@ -190,7 +190,16 @@ async def lifespan(app: Starlette):
 
 # --- MCP server setup ---
 
-mcp_server = Server("session-rag")
+mcp_server = Server(
+    "session-rag",
+    instructions=(
+        "Session-RAG provides semantic search over Claude Code conversation history. "
+        "When using search_session, ALWAYS pass the session_id parameter using the "
+        "CLAUDE_SESSION_ID environment variable to filter results to the current session. "
+        "Auto-resolution of session ID is not supported via HTTP headers. "
+        "Use search_all_sessions when you need to search across all past conversations."
+    ),
+)
 register_tools(mcp_server)
 
 session_manager = StreamableHTTPSessionManager(
