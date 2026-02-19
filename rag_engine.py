@@ -316,6 +316,41 @@ def _apply_recency_boost(results: List[Dict], n: int) -> List[Dict]:
     return results
 
 
+def get_turns(session_id: str, turn_index: int, context: int = 2,
+              db_path: Optional[str] = None) -> List[Dict]:
+    """Retrieve turns around a specific turn_index within a session.
+
+    Returns turns sorted by turn_index ascending, with the same field
+    mapping as search() (document → content).
+    """
+    low = max(0, turn_index - context)
+    high = turn_index + context
+
+    with milvus_client(db_path) as client:
+        results = client.query(
+            collection_name=COLLECTION_NAME,
+            filter=f'session_id == "{session_id}" && turn_index >= {low} && turn_index <= {high}',
+            output_fields=["document", "doc_id", "session_id", "transcript_file",
+                           "turn_index", "timestamp", "git_branch", "chunk_type"],
+        )
+
+    formatted = []
+    for row in results:
+        formatted.append({
+            "content": row["document"],
+            "doc_id": row.get("doc_id", ""),
+            "session_id": row.get("session_id", ""),
+            "transcript_file": row.get("transcript_file", ""),
+            "turn_index": row.get("turn_index", 0),
+            "timestamp": row.get("timestamp", ""),
+            "git_branch": row.get("git_branch", ""),
+            "chunk_type": row.get("chunk_type", ""),
+        })
+
+    formatted.sort(key=lambda r: r["turn_index"])
+    return formatted
+
+
 def get_stats(db_path: Optional[str] = None) -> Dict:
     """Get index statistics."""
     with milvus_client(db_path) as client:

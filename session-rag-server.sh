@@ -45,6 +45,8 @@ do_start() {
     echo "[session-rag] Starting HTTP server on port $PORT..." >&2
 
     export PYTHONPATH="$SCRIPT_DIR"
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
     nohup "$PYTHON" -u "$SCRIPT_DIR/http_server.py" >> "$LOG_FILE" 2>&1 &
     local server_pid=$!
 

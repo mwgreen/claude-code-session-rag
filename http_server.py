@@ -36,7 +36,7 @@ from tools import register_tools, set_current_project_root
 
 HOST = os.getenv("SESSION_RAG_HOST", "127.0.0.1")
 PORT = int(os.getenv("SESSION_RAG_PORT", "7102"))
-AUTO_EXPIRE_DAYS = int(os.getenv("SESSION_RAG_EXPIRE_DAYS", "30"))
+AUTO_EXPIRE_DAYS = int(os.getenv("SESSION_RAG_EXPIRE_DAYS", "365"))
 _EXPIRE_CHECK_INTERVAL = 86400  # Check once per day
 
 _SERVER_DIR = Path.home() / ".session-rag"

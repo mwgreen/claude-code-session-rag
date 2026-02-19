@@ -4,7 +4,7 @@ CLI tool to manage and clean up session-rag data.
 
 Usage:
     cleanup.py list        <project_root>                    # List all sessions
-    cleanup.py expire      <project_root> [--days N]         # Delete turns older than N days (default: 30)
+    cleanup.py expire      <project_root> [--days N]         # Delete turns older than N days (default: 365)
     cleanup.py delete      <project_root> --session <id>     # Delete a specific session
     cleanup.py delete      <project_root> --branch <name>    # Delete all turns for a branch
     cleanup.py reset       <project_root>                    # Drop everything and start fresh
@@ -122,7 +122,7 @@ def main():
     # expire
     p_expire = subparsers.add_parser("expire", help="Delete turns older than N days")
     p_expire.add_argument("project_root", help="Project root directory")
-    p_expire.add_argument("--days", type=int, default=30, help="Max age in days (default: 30)")
+    p_expire.add_argument("--days", type=int, default=365, help="Max age in days (default: 365)")
 
     # delete
     p_delete = subparsers.add_parser("delete", help="Delete by session or branch")

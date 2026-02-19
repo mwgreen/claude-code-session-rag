@@ -5,3 +5,4 @@ __pycache__/
 .session-rag/
 *.egg-info/
 mcp-config-template.json
+.mcp.json

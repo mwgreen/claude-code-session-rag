@@ -53,24 +53,55 @@ def format_results(results: list[dict]) -> str:
     output = []
     for i, r in enumerate(results, 1):
         # Header with metadata
-        session_short = r.get("session_id", "")[:8]
+        session_id = r.get("session_id", "")
         branch = r.get("git_branch", "")
         ts = r.get("timestamp", "")[:19]  # trim to readable
         chunk_type = r.get("chunk_type", "turn")
         similarity = 1 - r.get("distance", 0)
+
+        turn_index = r.get("turn_index", 0)
 
         header_parts = [f"**Result {i}**"]
         if ts:
             header_parts.append(f"({ts})")
         if branch:
             header_parts.append(f"[{branch}]")
-        if session_short:
-            header_parts.append(f"session:{session_short}")
+        if session_id:
+            header_parts.append(f"session:{session_id}")
 
         output.append(" ".join(header_parts))
 
-        meta = f"*Type: {chunk_type} | Relevance: {similarity:.2f}*"
+        meta = f"*Turn: {turn_index} | Type: {chunk_type} | Relevance: {similarity:.2f}*"
         output.append(meta)
+        output.append("")
+        output.append(r.get("content", ""))
+        output.append("")
+        output.append("---")
+        output.append("")
+
+    return "\n".join(output)
+
+
+def format_turns(results: list[dict]) -> str:
+    """Format get_turns results as markdown."""
+    if not results:
+        return "No turns found."
+
+    output = []
+    for r in results:
+        turn_index = r.get("turn_index", 0)
+        ts = r.get("timestamp", "")[:19]
+        chunk_type = r.get("chunk_type", "turn")
+        branch = r.get("git_branch", "")
+
+        header_parts = [f"**Turn {turn_index}**"]
+        if ts:
+            header_parts.append(f"({ts})")
+        if branch:
+            header_parts.append(f"[{branch}]")
+
+        output.append(" ".join(header_parts))
+        output.append(f"*Type: {chunk_type}*")
         output.append("")
         output.append(r.get("content", ""))
         output.append("")
@@ -161,6 +192,33 @@ def register_tools(server: Server):
                 },
             ),
             types.Tool(
+                name="get_turns",
+                description=(
+                    "Retrieve conversation turns surrounding a specific turn index within a session. "
+                    "Use this after search_session or search_all_sessions to see the full context "
+                    "around a search hit."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "The session ID (from a search result)",
+                        },
+                        "turn_index": {
+                            "type": "integer",
+                            "description": "The turn index to center on (from a search result)",
+                        },
+                        "context": {
+                            "type": "integer",
+                            "description": "Number of turns before and after to include (default: 2)",
+                            "default": 2,
+                        },
+                    },
+                    "required": ["session_id", "turn_index"],
+                },
+            ),
+            types.Tool(
                 name="get_session_stats",
                 description="Get session index statistics (turn count, session count, branches)",
                 inputSchema={
@@ -224,6 +282,15 @@ def register_tools(server: Server):
                     db_path=db,
                 )
                 return [types.TextContent(type="text", text=format_results(results))]
+
+            elif name == "get_turns":
+                results = rag_engine.get_turns(
+                    arguments["session_id"],
+                    arguments["turn_index"],
+                    context=arguments.get("context", 2),
+                    db_path=db,
+                )
+                return [types.TextContent(type="text", text=format_turns(results))]
 
             elif name == "get_session_stats":
                 stats = rag_engine.get_stats(db_path=db)
