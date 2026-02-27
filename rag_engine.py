@@ -2,10 +2,12 @@
 RAG engine for session transcripts.
 
 Embeds conversation turns with ModernBERT Embed Base (768 dims, 8192 token context)
-via mlx-embeddings. Stores vectors in Milvus Lite, one DB per project.
+via mlx-embeddings. Stores vectors in a single global Milvus Lite DB at ~/.session-rag/.
 
 Full-text search via SQLite FTS5 sidecar for hybrid search (vector + keyword).
 Results merged with Reciprocal Rank Fusion (RRF).
+
+Each turn is tagged with a project_root field, enabling per-project or cross-project search.
 """
 
 import hashlib
@@ -72,7 +74,7 @@ def embed_texts(texts: List[str], is_query: bool = False) -> List[List[float]]:
 # --- Milvus client management ---
 
 _persistent_clients: Dict[str, MilvusClient] = {}
-_fts = FTSIndex("turns_fts", ["session_id", "git_branch", "turn_index", "timestamp", "chunk_type"])
+_fts = FTSIndex("turns_fts", ["session_id", "git_branch", "turn_index", "timestamp", "chunk_type", "project_root"])
 _write_lock: Optional[asyncio.Lock] = None
 _embed_semaphore: Optional[asyncio.Semaphore] = None
 _server_mode = False
@@ -131,7 +133,7 @@ def _get_persistent_client(db_path: str) -> MilvusClient:
 
 def _resolve_db_path(db_path: Optional[str]) -> str:
     if not db_path:
-        raise ValueError("db_path is required. Each project stores its index at {project}/.session-rag/milvus.db")
+        raise ValueError("db_path is required. Global index is at ~/.session-rag/milvus.db")
     return db_path
 
 
@@ -153,6 +155,7 @@ def _ensure_collection(client: MilvusClient):
         FieldSchema(name="timestamp", dtype=DataType.VARCHAR, max_length=64),
         FieldSchema(name="git_branch", dtype=DataType.VARCHAR, max_length=256),
         FieldSchema(name="chunk_type", dtype=DataType.VARCHAR, max_length=64),
+        FieldSchema(name="project_root", dtype=DataType.VARCHAR, max_length=512),
     ])
 
     index_params = client.prepare_index_params()
@@ -240,6 +243,7 @@ def add_turns(turns: List[Dict], db_path: Optional[str] = None) -> int:
             "timestamp": turn.get("timestamp", ""),
             "git_branch": turn.get("git_branch", ""),
             "chunk_type": turn.get("chunk_type", "turn"),
+            "project_root": turn.get("project_root", ""),
         })
 
     with milvus_client(db_path) as client:
@@ -257,6 +261,7 @@ def add_turns(turns: List[Dict], db_path: Optional[str] = None) -> int:
                 "turn_index": t.get("turn_index", 0),
                 "timestamp": t.get("timestamp", ""),
                 "chunk_type": t.get("chunk_type", "turn"),
+                "project_root": t.get("project_root", ""),
             } for t in new_turns]
             _fts.insert(fts_conn, fts_records)
             _fts.close_ephemeral(fts_conn)
@@ -267,12 +272,16 @@ def add_turns(turns: List[Dict], db_path: Optional[str] = None) -> int:
 
 
 def search(query: str, n: int = 5, session_id: Optional[str] = None,
-           git_branch: Optional[str] = None, recency_boost: bool = False,
+           git_branch: Optional[str] = None, project_root: Optional[str] = None,
+           recency_boost: bool = False,
            db_path: Optional[str] = None) -> List[Dict]:
     """Hybrid search: vector similarity + FTS5 keyword search, merged with RRF.
 
     Both engines run with an expanded candidate pool (n*3), then RRF merges
     the two ranked lists. Recency boost is applied after merging.
+
+    project_root: when set, restricts results to that project. When None,
+    searches across all projects (cross-project search).
     """
     # Expanded candidate pool for both engines
     fetch_n = n * 3
@@ -285,6 +294,8 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
         filters.append(f'session_id == "{session_id}"')
     if git_branch:
         filters.append(f'git_branch == "{git_branch}"')
+    if project_root:
+        filters.append(f'project_root == "{project_root}"')
     filter_expr = " && ".join(filters) if filters else None
 
     with milvus_client(db_path) as client:
@@ -294,7 +305,8 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
             limit=fetch_n,
             filter=filter_expr,
             output_fields=["document", "doc_id", "session_id", "transcript_file",
-                           "turn_index", "timestamp", "git_branch", "chunk_type"],
+                           "turn_index", "timestamp", "git_branch", "chunk_type",
+                           "project_root"],
         )
 
     vector_results = []
@@ -310,6 +322,7 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
                 "timestamp": entity.get("timestamp", ""),
                 "git_branch": entity.get("git_branch", ""),
                 "chunk_type": entity.get("chunk_type", ""),
+                "project_root": entity.get("project_root", ""),
                 "distance": hit["distance"],
             })
 
@@ -319,6 +332,8 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
         fts_filters["session_id"] = session_id
     if git_branch:
         fts_filters["git_branch"] = git_branch
+    if project_root:
+        fts_filters["project_root"] = project_root
     fts_results = _fts.search(query, n=fetch_n, filters=fts_filters or None, db_path=db_path)
 
     # --- Merge with RRF ---
@@ -458,18 +473,20 @@ def get_turns(session_id: str, turn_index: int, context: int = 2,
     return formatted
 
 
-def get_stats(db_path: Optional[str] = None) -> Dict:
-    """Get index statistics."""
+def get_stats(project_root: Optional[str] = None, db_path: Optional[str] = None) -> Dict:
+    """Get index statistics. Optionally filter to a specific project."""
     with milvus_client(db_path) as client:
         if not client.has_collection(COLLECTION_NAME):
             return {"total_turns": 0, "sessions": 0, "by_type": {}}
 
-        stats = client.get_collection_stats(COLLECTION_NAME)
-        total = stats["row_count"]
-
     # Query for breakdowns (capped by Milvus offset limit)
-    all_results = _query_all(["session_id", "chunk_type", "git_branch"], db_path=db_path)
+    all_results = _query_all(
+        ["session_id", "chunk_type", "git_branch", "project_root"],
+        filter_expr=f'project_root == "{project_root}"' if project_root else None,
+        db_path=db_path,
+    )
 
+    total = len(all_results)
     sessions = set(r["session_id"] for r in all_results if r.get("session_id"))
     branches = set(r["git_branch"] for r in all_results if r.get("git_branch"))
 
@@ -486,8 +503,10 @@ def get_stats(db_path: Optional[str] = None) -> Dict:
     }
 
 
-def _query_all(output_fields: list, batch_size: int = 1000, db_path: Optional[str] = None) -> list:
-    """Query all rows with offset pagination."""
+def _query_all(output_fields: list, batch_size: int = 1000,
+               filter_expr: Optional[str] = None,
+               db_path: Optional[str] = None) -> list:
+    """Query all rows with offset pagination. Optional filter expression."""
     MILVUS_MAX = 16384
     all_results = []
     offset = 0
@@ -499,7 +518,7 @@ def _query_all(output_fields: list, batch_size: int = 1000, db_path: Optional[st
             effective_limit = min(batch_size, MILVUS_MAX - offset)
             batch = client.query(
                 collection_name=COLLECTION_NAME,
-                filter="",
+                filter=filter_expr or "",
                 limit=effective_limit,
                 offset=offset,
                 output_fields=output_fields,
@@ -621,10 +640,12 @@ def clear_collection(db_path: Optional[str] = None):
         _fts.clear(db_path)
 
 
-def list_sessions(db_path: Optional[str] = None) -> List[Dict]:
-    """List all sessions with turn counts and date ranges."""
+def list_sessions(project_root: Optional[str] = None,
+                  db_path: Optional[str] = None) -> List[Dict]:
+    """List all sessions with turn counts and date ranges. Optionally filter by project."""
     all_results = _query_all(
-        ["session_id", "timestamp", "git_branch", "chunk_type"],
+        ["session_id", "timestamp", "git_branch", "chunk_type", "project_root"],
+        filter_expr=f'project_root == "{project_root}"' if project_root else None,
         db_path=db_path,
     )
 
@@ -666,7 +687,8 @@ def list_sessions(db_path: Optional[str] = None) -> List[Dict]:
 # --- Async wrappers ---
 
 async def search_async(query: str, n: int = 5, session_id: Optional[str] = None,
-                       git_branch: Optional[str] = None, recency_boost: bool = False,
+                       git_branch: Optional[str] = None, project_root: Optional[str] = None,
+                       recency_boost: bool = False,
                        db_path: Optional[str] = None) -> List[Dict]:
     """Async search with embed semaphore."""
     loop = asyncio.get_event_loop()
@@ -674,10 +696,10 @@ async def search_async(query: str, n: int = 5, session_id: Optional[str] = None,
     if _embed_semaphore is not None:
         async with _embed_semaphore:
             return await loop.run_in_executor(
-                None, lambda: search(query, n, session_id, git_branch, recency_boost, db_path))
+                None, lambda: search(query, n, session_id, git_branch, project_root, recency_boost, db_path))
     else:
         return await loop.run_in_executor(
-            None, lambda: search(query, n, session_id, git_branch, recency_boost, db_path))
+            None, lambda: search(query, n, session_id, git_branch, project_root, recency_boost, db_path))
 
 
 async def add_turns_async(turns: List[Dict], db_path: Optional[str] = None) -> int:

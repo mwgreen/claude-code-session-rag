@@ -4,7 +4,7 @@ Persistent HTTP server for session-rag MCP system.
 
 Runs as a long-lived process serving MCP via StreamableHTTP.
 Projects are identified by the X-Project-Root header in each request.
-The DB for each project lives at {project_root}/.session-rag/milvus.db.
+All projects share a single global DB at ~/.session-rag/milvus.db.
 
 Start: ./session-rag-server.sh
 Health: curl http://127.0.0.1:7102/health
@@ -139,7 +139,7 @@ async def index_endpoint(request: Request) -> JSONResponse:
             status_code=400,
         )
 
-    db_path = str(Path(project_root) / ".session-rag" / "milvus.db")
+    db_path = str(Path.home() / ".session-rag" / "milvus.db")
 
     # Ensure file watcher is running for this project
     await file_watcher.ensure_watcher(project_root, db_path)
@@ -158,6 +158,10 @@ async def index_endpoint(request: Request) -> JSONResponse:
         transcript_parser.set_transcript_offset(state, transcript_path, new_offset)
         transcript_parser.save_index_state(project_root, state)
         return JSONResponse({"indexed": 0, "message": "No new turns to index"})
+
+    # Inject project_root into each turn
+    for t in turns:
+        t["project_root"] = project_root
 
     # Index turns
     count = await rag_engine.add_turns_async(turns, db_path=db_path)
@@ -212,7 +216,7 @@ async def watch_endpoint(request: Request) -> JSONResponse:
             status_code=400,
         )
 
-    db_path = str(Path(project_root) / ".session-rag" / "milvus.db")
+    db_path = str(Path.home() / ".session-rag" / "milvus.db")
 
     # Ensure watcher is running
     watcher = await file_watcher.ensure_watcher(project_root, db_path)

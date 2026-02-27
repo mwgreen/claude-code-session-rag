@@ -245,6 +245,8 @@ class TranscriptWatcher:
                     )
 
                     if turns:
+                        for t in turns:
+                            t["project_root"] = self.project_root
                         loop = asyncio.get_event_loop()
                         count = await rag_engine.add_turns_async(
                             turns, db_path=self.db_path)
@@ -314,6 +316,8 @@ class TranscriptWatcher:
                 )
 
                 if turns:
+                    for t in turns:
+                        t["project_root"] = self.project_root
                     count = await rag_engine.add_turns_async(
                         turns, db_path=self.db_path)
                     total_indexed += count

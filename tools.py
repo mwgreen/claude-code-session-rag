@@ -40,8 +40,8 @@ def get_current_project_root() -> str:
 
 
 def get_db_path() -> str:
-    root = get_current_project_root()
-    return str(Path(root) / ".session-rag" / "milvus.db")
+    """Global DB path — all projects share one index at ~/.session-rag/."""
+    return str(Path.home() / ".session-rag" / "milvus.db")
 
 
 # --- Formatting helpers ---
@@ -62,11 +62,15 @@ def format_results(results: list[dict]) -> str:
 
         turn_index = r.get("turn_index", 0)
 
+        project = r.get("project_root", "")
+
         header_parts = [f"**Result {i}**"]
         if ts:
             header_parts.append(f"({ts})")
         if branch:
             header_parts.append(f"[{branch}]")
+        if project:
+            header_parts.append(f"project:{Path(project).name}")
         if session_id:
             header_parts.append(f"session:{session_id}")
 
@@ -188,6 +192,10 @@ def register_tools(server: Server):
                             "type": "string",
                             "description": "Filter by git branch name (e.g., 'develop', 'feature/my-feature')",
                         },
+                        "project_root": {
+                            "type": "string",
+                            "description": "Filter to a specific project path, or '*' for all projects. Default: current project.",
+                        },
                     },
                     "required": ["query"],
                 },
@@ -249,6 +257,10 @@ def register_tools(server: Server):
                             "type": "string",
                             "description": "Delete all turns for this git branch",
                         },
+                        "project_root": {
+                            "type": "string",
+                            "description": "Filter cleanup to a specific project path. Default: current project.",
+                        },
                     },
                     "required": [],
                 },
@@ -257,10 +269,13 @@ def register_tools(server: Server):
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+        db = get_db_path()
+
+        # Resolve project_root for scoping
         try:
-            db = get_db_path()
-        except ProjectNotConfiguredError as e:
-            return [types.TextContent(type="text", text=str(e))]
+            current_project = get_current_project_root()
+        except ProjectNotConfiguredError:
+            current_project = None
 
         try:
             if name == "search_session":
@@ -269,16 +284,27 @@ def register_tools(server: Server):
                     arguments["query"],
                     arguments.get("n", 5),
                     session_id=session_id,
+                    project_root=current_project,
                     recency_boost=True,
                     db_path=db,
                 )
                 return [types.TextContent(type="text", text=format_results(results))]
 
             elif name == "search_all_sessions":
+                # project_root scoping: default=current project, "*"=all projects
+                pr_arg = arguments.get("project_root")
+                if pr_arg == "*":
+                    pr = None  # cross-project search
+                elif pr_arg:
+                    pr = pr_arg  # explicit project
+                else:
+                    pr = current_project  # default: current project
+
                 results = rag_engine.search(
                     arguments["query"],
                     arguments.get("n", 10),
                     git_branch=arguments.get("git_branch"),
+                    project_root=pr,
                     recency_boost=False,
                     db_path=db,
                 )
@@ -294,7 +320,10 @@ def register_tools(server: Server):
                 return [types.TextContent(type="text", text=format_turns(results))]
 
             elif name == "get_session_stats":
-                stats = rag_engine.get_stats(db_path=db)
+                stats = rag_engine.get_stats(
+                    project_root=current_project,
+                    db_path=db,
+                )
                 return [types.TextContent(type="text", text=format_stats(stats, db))]
 
             elif name == "cleanup_sessions":
@@ -319,7 +348,10 @@ def register_tools(server: Server):
                     count = rag_engine.delete_by_branch(branch, db_path=db)
                     parts.append(f"Deleted {count} turns for branch '{branch}'")
 
-                stats = rag_engine.get_stats(db_path=db)
+                stats = rag_engine.get_stats(
+                    project_root=current_project,
+                    db_path=db,
+                )
                 parts.append(f"\nRemaining: {stats['total_turns']} turns across {stats['sessions']} sessions")
                 return [types.TextContent(type="text", text="\n".join(parts))]
 

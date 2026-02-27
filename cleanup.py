@@ -2,13 +2,16 @@
 """
 CLI tool to manage and clean up session-rag data.
 
+All data lives in a single global DB at ~/.session-rag/milvus.db.
+Use --project to filter to a specific project.
+
 Usage:
-    cleanup.py list        <project_root>                    # List all sessions
-    cleanup.py expire      <project_root> [--days N]         # Delete turns older than N days (default: 365)
-    cleanup.py delete      <project_root> --session <id>     # Delete a specific session
-    cleanup.py delete      <project_root> --branch <name>    # Delete all turns for a branch
-    cleanup.py reset       <project_root>                    # Drop everything and start fresh
-    cleanup.py stats       <project_root>                    # Show index statistics
+    cleanup.py list        [--project <root>]                # List all sessions
+    cleanup.py expire      [--days N]                        # Delete turns older than N days (default: 365)
+    cleanup.py delete      --session <id>                    # Delete a specific session
+    cleanup.py delete      --branch <name>                   # Delete all turns for a branch
+    cleanup.py reset                                         # Drop everything and start fresh
+    cleanup.py stats       [--project <root>]                # Show index statistics
 """
 
 import argparse
@@ -18,13 +21,15 @@ from pathlib import Path
 import rag_engine
 
 
-def get_db_path(project_root: str) -> str:
-    return str(Path(project_root) / ".session-rag" / "milvus.db")
+def get_db_path() -> str:
+    """Global DB path — all projects share one index."""
+    return str(Path.home() / ".session-rag" / "milvus.db")
 
 
 def cmd_list(args):
-    db = get_db_path(args.project_root)
-    sessions = rag_engine.list_sessions(db_path=db)
+    db = get_db_path()
+    project = getattr(args, 'project', None)
+    sessions = rag_engine.list_sessions(project_root=project, db_path=db)
 
     if not sessions:
         print("No sessions indexed.")
@@ -42,7 +47,7 @@ def cmd_list(args):
 
 
 def cmd_expire(args):
-    db = get_db_path(args.project_root)
+    db = get_db_path()
     days = args.days
 
     # Show what would be deleted
@@ -58,7 +63,7 @@ def cmd_expire(args):
 
 
 def cmd_delete(args):
-    db = get_db_path(args.project_root)
+    db = get_db_path()
 
     if args.session:
         count = rag_engine.delete_by_session(args.session, db_path=db)
@@ -72,10 +77,10 @@ def cmd_delete(args):
 
 
 def cmd_reset(args):
-    db = get_db_path(args.project_root)
+    db = get_db_path()
 
     if not args.yes:
-        answer = input(f"This will delete ALL indexed data for {args.project_root}. Continue? [y/N] ")
+        answer = input("This will delete ALL indexed data (all projects). Continue? [y/N] ")
         if answer.lower() != "y":
             print("Cancelled.")
             return
@@ -90,17 +95,16 @@ def cmd_reset(args):
         if f.exists():
             f.unlink()
 
-    # Also clear index state
-    from transcript_parser import save_index_state
-    save_index_state(args.project_root, {})
-
     print("Reset complete. All session data deleted.")
 
 
 def cmd_stats(args):
-    db = get_db_path(args.project_root)
-    stats = rag_engine.get_stats(db_path=db)
+    db = get_db_path()
+    project = getattr(args, 'project', None)
+    stats = rag_engine.get_stats(project_root=project, db_path=db)
 
+    if project:
+        print(f"Project:      {project}")
     print(f"Total turns:  {stats['total_turns']}")
     print(f"Sessions:     {stats['sessions']}")
 
@@ -125,27 +129,24 @@ def main():
 
     # list
     p_list = subparsers.add_parser("list", help="List all indexed sessions")
-    p_list.add_argument("project_root", help="Project root directory")
+    p_list.add_argument("--project", help="Filter to a specific project root")
 
     # expire
     p_expire = subparsers.add_parser("expire", help="Delete turns older than N days")
-    p_expire.add_argument("project_root", help="Project root directory")
     p_expire.add_argument("--days", type=int, default=365, help="Max age in days (default: 365)")
 
     # delete
     p_delete = subparsers.add_parser("delete", help="Delete by session or branch")
-    p_delete.add_argument("project_root", help="Project root directory")
     p_delete.add_argument("--session", help="Session ID to delete")
     p_delete.add_argument("--branch", help="Git branch to delete")
 
     # reset
     p_reset = subparsers.add_parser("reset", help="Delete all data (full reset)")
-    p_reset.add_argument("project_root", help="Project root directory")
     p_reset.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
 
     # stats
     p_stats = subparsers.add_parser("stats", help="Show index statistics")
-    p_stats.add_argument("project_root", help="Project root directory")
+    p_stats.add_argument("--project", help="Filter to a specific project root")
 
     args = parser.parse_args()
 
