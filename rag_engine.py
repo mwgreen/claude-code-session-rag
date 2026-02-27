@@ -5,6 +5,7 @@ Embeds conversation turns with ModernBERT Embed Base (768 dims, 8192 token conte
 via mlx-embeddings. Stores vectors in Milvus Lite, one DB per project.
 """
 
+import hashlib
 import os
 from pathlib import Path
 
@@ -216,7 +217,10 @@ def add_turns(turns: List[Dict], db_path: Optional[str] = None) -> int:
 
     data = []
     for turn, emb in zip(new_turns, embeddings):
-        int_id = hash(turn["doc_id"]) & 0x7FFFFFFFFFFFFFFF
+        # Stable hash: SHA-256 truncated to int64. Python's hash() is
+        # randomized per process, so the same doc_id would get different
+        # primary keys across server restarts.
+        int_id = int(hashlib.sha256(turn["doc_id"].encode()).hexdigest()[:15], 16)
         data.append({
             "id": int_id,
             "vector": emb,
@@ -349,22 +353,44 @@ def get_turns(session_id: str, turn_index: int, context: int = 2,
               db_path: Optional[str] = None) -> List[Dict]:
     """Retrieve turns around a specific turn_index within a session.
 
+    turn_index is a byte offset into the transcript file. context is the
+    number of neighboring turns (before and after) to include. We fetch all
+    turns for the session, sort by turn_index, find the target, and return
+    the surrounding window.
+
     Returns turns sorted by turn_index ascending, with the same field
     mapping as search() (document → content).
     """
-    low = max(0, turn_index - context)
-    high = turn_index + context
-
     with milvus_client(db_path) as client:
         results = client.query(
             collection_name=COLLECTION_NAME,
-            filter=f'session_id == "{session_id}" && turn_index >= {low} && turn_index <= {high}',
+            filter=f'session_id == "{session_id}"',
             output_fields=["document", "doc_id", "session_id", "transcript_file",
                            "turn_index", "timestamp", "git_branch", "chunk_type"],
+            limit=16384,
         )
 
+    if not results:
+        return []
+
+    # Sort all turns by turn_index (byte offset)
+    results.sort(key=lambda r: r.get("turn_index", 0))
+
+    # Find the target turn (closest match to requested turn_index)
+    target_idx = 0
+    min_dist = float("inf")
+    for i, row in enumerate(results):
+        dist = abs(row.get("turn_index", 0) - turn_index)
+        if dist < min_dist:
+            min_dist = dist
+            target_idx = i
+
+    # Extract window: context turns before and after
+    start = max(0, target_idx - context)
+    end = min(len(results), target_idx + context + 1)
+
     formatted = []
-    for row in results:
+    for row in results[start:end]:
         formatted.append({
             "content": row["document"],
             "doc_id": row.get("doc_id", ""),
@@ -376,7 +402,6 @@ def get_turns(session_id: str, turn_index: int, context: int = 2,
             "chunk_type": row.get("chunk_type", ""),
         })
 
-    formatted.sort(key=lambda r: r["turn_index"])
     return formatted
 
 

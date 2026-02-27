@@ -18,6 +18,7 @@ Incremental reading:
 - On each invocation, seek to offset, read only new lines
 """
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -44,14 +45,10 @@ def parse_transcript(
     """
     turns = []
     current_user_text = None
+    current_user_start_byte = 0
     current_assistant_texts = []
     current_timestamp = ""
     current_git_branch = ""
-    turn_index = 0
-
-    # Count existing turns from before this parse to continue turn_index
-    # (For simplicity, we start at 0 within each incremental parse batch.
-    #  The doc_id uses session_id::turn_index which is unique per session.)
 
     file_size = os.path.getsize(transcript_path)
     if start_offset >= file_size:
@@ -98,29 +95,34 @@ def parse_transcript(
                 if current_user_text is not None:
                     turn = _build_turn(
                         current_user_text, current_assistant_texts,
-                        session_id, transcript_file, turn_index,
+                        session_id, transcript_file,
+                        current_user_start_byte,
                         current_timestamp, current_git_branch,
                         max_turn_chars, "turn",
                     )
                     if turn:
                         turns.append(turn)
-                        turn_index += 1
                     current_user_text = None
                     current_assistant_texts = []
 
                 summary_text = entry.get("summary", "")
                 if summary_text:
+                    summary_full = f"Session Summary: {summary_text}"
+                    # Use current byte offset as turn_index for summaries
+                    summary_byte = current_offset - len(line.encode("utf-8")) if line else current_offset
+                    content_hash = hashlib.sha256(
+                        f"{summary_byte}:{summary_full}".encode()
+                    ).hexdigest()[:16]
                     turns.append({
-                        "text": f"Session Summary: {summary_text}",
-                        "doc_id": f"{session_id}::summary::{turn_index}",
+                        "text": summary_full,
+                        "doc_id": f"{session_id}::{content_hash}",
                         "session_id": session_id,
                         "transcript_file": transcript_file,
-                        "turn_index": turn_index,
+                        "turn_index": summary_byte,
                         "timestamp": current_timestamp,
                         "git_branch": current_git_branch,
                         "chunk_type": "summary",
                     })
-                    turn_index += 1
                 continue
 
             # Handle user messages
@@ -144,16 +146,17 @@ def parse_transcript(
                 if current_user_text is not None:
                     turn = _build_turn(
                         current_user_text, current_assistant_texts,
-                        session_id, transcript_file, turn_index,
+                        session_id, transcript_file,
+                        current_user_start_byte,
                         current_timestamp, current_git_branch,
                         max_turn_chars, "turn",
                     )
                     if turn:
                         turns.append(turn)
-                        turn_index += 1
 
-                # Start new turn
+                # Start new turn — record byte position for content-based doc_id
                 current_user_text = content.strip()
+                current_user_start_byte = current_offset - line_bytes
                 current_assistant_texts = []
                 continue
 
@@ -177,7 +180,8 @@ def parse_transcript(
         if current_user_text is not None:
             turn = _build_turn(
                 current_user_text, current_assistant_texts,
-                session_id, transcript_file, turn_index,
+                session_id, transcript_file,
+                current_user_start_byte,
                 current_timestamp, current_git_branch,
                 max_turn_chars, "turn",
             )
@@ -192,13 +196,22 @@ def _build_turn(
     assistant_texts: List[str],
     session_id: str,
     transcript_file: str,
-    turn_index: int,
+    start_byte: int,
     timestamp: str,
     git_branch: str,
     max_chars: int,
     chunk_type: str,
 ) -> Optional[Dict]:
-    """Build a turn dict from user + assistant text."""
+    """Build a turn dict from user + assistant text.
+
+    doc_id uses a content hash (SHA-256 of byte position + text) to guarantee
+    uniqueness across incremental parses. This avoids the turn_index reset bug
+    where subsequent parse batches would collide with earlier ones.
+
+    turn_index uses the byte offset where the user message starts. This is
+    naturally monotonic across incremental parses (later turns always have
+    higher byte offsets), making get_turns context browsing work correctly.
+    """
     parts = [f"User: {user_text}"]
     if assistant_texts:
         combined_assistant = "\n\n".join(assistant_texts)
@@ -214,12 +227,19 @@ def _build_turn(
     if len(text.strip()) < 20:
         return None
 
+    # Content-addressed doc_id: hash of byte position + text.
+    # - Byte position ensures identical text at different positions gets unique IDs
+    # - Content ensures re-indexing the same position produces the same ID (idempotent)
+    content_hash = hashlib.sha256(
+        f"{start_byte}:{text}".encode()
+    ).hexdigest()[:16]
+
     return {
         "text": text,
-        "doc_id": f"{session_id}::{turn_index}",
+        "doc_id": f"{session_id}::{content_hash}",
         "session_id": session_id,
         "transcript_file": transcript_file,
-        "turn_index": turn_index,
+        "turn_index": start_byte,
         "timestamp": timestamp,
         "git_branch": git_branch,
         "chunk_type": chunk_type,
