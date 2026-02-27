@@ -71,10 +71,6 @@ def cmd_delete(args):
         sys.exit(1)
 
 
-def get_fts_path(project_root: str) -> str:
-    return str(Path(project_root) / ".session-rag" / "fts.db")
-
-
 def cmd_reset(args):
     db = get_db_path(args.project_root)
 
@@ -86,13 +82,13 @@ def cmd_reset(args):
 
     rag_engine.clear_collection(db_path=db)
 
-    # Also clear FTS database (clear_collection handles it, but ensure file cleanup)
-    fts_path = Path(get_fts_path(args.project_root))
-    for suffix in ("", "-wal", "-shm"):
+    # Clean up WAL/SHM files left by SQLite FTS
+    from fts_hybrid import FTSIndex
+    fts_path = Path(FTSIndex.db_path(db))
+    for suffix in ("-wal", "-shm"):
         f = Path(str(fts_path) + suffix)
         if f.exists():
             f.unlink()
-            print(f"Deleted {f}")
 
     # Also clear index state
     from transcript_parser import save_index_state

@@ -10,7 +10,6 @@ Results merged with Reciprocal Rank Fusion (RRF).
 
 import hashlib
 import os
-import sqlite3
 from pathlib import Path
 
 # Auto-enable offline mode if model is already cached (avoid network calls)
@@ -28,6 +27,8 @@ import asyncio
 import logging
 import sys
 import time
+
+from fts_hybrid import FTSIndex, rrf_merge
 
 logger = logging.getLogger("session-rag.milvus")
 
@@ -71,7 +72,7 @@ def embed_texts(texts: List[str], is_query: bool = False) -> List[List[float]]:
 # --- Milvus client management ---
 
 _persistent_clients: Dict[str, MilvusClient] = {}
-_persistent_fts: Dict[str, sqlite3.Connection] = {}
+_fts = FTSIndex("turns_fts", ["session_id", "git_branch", "turn_index", "timestamp", "chunk_type"])
 _write_lock: Optional[asyncio.Lock] = None
 _embed_semaphore: Optional[asyncio.Semaphore] = None
 _server_mode = False
@@ -83,6 +84,7 @@ def init_server_mode():
     _write_lock = asyncio.Lock()
     _embed_semaphore = asyncio.Semaphore(1)
     _server_mode = True
+    _fts.set_server_mode(True)
     print("Server mode initialized", file=sys.stderr)
 
 
@@ -96,204 +98,10 @@ def close_server_mode():
         except Exception as e:
             logger.warning("Error closing Milvus client %s: %s", path, e)
     _persistent_clients.clear()
-    for path, conn in list(_persistent_fts.items()):
-        try:
-            conn.close()
-            logger.info("Closed FTS connection: %s", path)
-        except Exception as e:
-            logger.warning("Error closing FTS connection %s: %s", path, e)
-    _persistent_fts.clear()
+    _fts.close_all()
     _write_lock = None
     _embed_semaphore = None
     _server_mode = False
-
-
-# --- FTS5 SQLite sidecar ---
-
-def _fts_db_path(milvus_db_path: str) -> str:
-    """Derive the FTS database path from the Milvus DB path.
-
-    milvus.db -> fts.db in the same directory.
-    """
-    return str(Path(milvus_db_path).parent / "fts.db")
-
-
-def _get_fts_connection(milvus_db_path: str) -> sqlite3.Connection:
-    """Get or create a persistent FTS SQLite connection."""
-    fts_path = _fts_db_path(milvus_db_path)
-
-    if fts_path in _persistent_fts:
-        try:
-            _persistent_fts[fts_path].execute("SELECT 1")
-            return _persistent_fts[fts_path]
-        except Exception:
-            logger.warning("Stale FTS connection for %s — reconnecting", fts_path)
-            try:
-                _persistent_fts[fts_path].close()
-            except Exception:
-                pass
-            del _persistent_fts[fts_path]
-
-    Path(fts_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(fts_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    _ensure_fts_table(conn)
-
-    if _server_mode:
-        _persistent_fts[fts_path] = conn
-        logger.info("Opened FTS connection: %s", fts_path)
-
-    return conn
-
-
-def _ensure_fts_table(conn: sqlite3.Connection):
-    """Create the FTS5 virtual table if it doesn't exist."""
-    conn.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
-            doc_id,
-            content,
-            session_id UNINDEXED,
-            git_branch UNINDEXED,
-            turn_index UNINDEXED,
-            timestamp UNINDEXED,
-            chunk_type UNINDEXED
-        )
-    """)
-    conn.commit()
-
-
-def _fts_insert(conn: sqlite3.Connection, turns: List[Dict]):
-    """Insert turns into the FTS5 table. Skips duplicates by doc_id."""
-    for turn in turns:
-        doc_id = turn["doc_id"]
-        # Check for existing doc_id
-        existing = conn.execute(
-            "SELECT doc_id FROM turns_fts WHERE doc_id = ?", (doc_id,)
-        ).fetchone()
-        if existing:
-            continue
-        conn.execute(
-            "INSERT INTO turns_fts (doc_id, content, session_id, git_branch, turn_index, timestamp, chunk_type) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                doc_id,
-                turn["text"][:65535],
-                turn.get("session_id", ""),
-                turn.get("git_branch", ""),
-                turn.get("turn_index", 0),
-                turn.get("timestamp", ""),
-                turn.get("chunk_type", "turn"),
-            ),
-        )
-    conn.commit()
-
-
-def fts_search(query: str, n: int = 15, session_id: Optional[str] = None,
-               git_branch: Optional[str] = None,
-               db_path: Optional[str] = None) -> List[Dict]:
-    """Full-text search using FTS5 BM25 ranking.
-
-    Returns results sorted by BM25 relevance (lower rank = more relevant).
-    """
-    if not db_path:
-        return []
-
-    try:
-        conn = _get_fts_connection(db_path)
-    except Exception as e:
-        logger.warning("FTS connection failed: %s", e)
-        return []
-
-    # Escape double quotes in query for FTS5
-    safe_query = query.replace('"', '""')
-
-    # Build the WHERE clause for filters
-    where_parts = []
-    params: list = []
-    if session_id:
-        where_parts.append("session_id = ?")
-        params.append(session_id)
-    if git_branch:
-        where_parts.append("git_branch = ?")
-        params.append(git_branch)
-
-    where_clause = (" AND " + " AND ".join(where_parts)) if where_parts else ""
-
-    # FTS5 query: try phrase match first, fall back to term match
-    # bm25() returns negative scores where more negative = more relevant
-    sql = f"""
-        SELECT doc_id, content, session_id, git_branch, turn_index, timestamp, chunk_type,
-               bm25(turns_fts, 0, 1, 0, 0, 0, 0, 0) as rank
-        FROM turns_fts
-        WHERE turns_fts MATCH ?{where_clause}
-        ORDER BY rank
-        LIMIT ?
-    """
-    params_full = [safe_query] + params + [n]
-
-    try:
-        rows = conn.execute(sql, params_full).fetchall()
-    except Exception as e:
-        # FTS5 MATCH can fail on syntax errors in query; try simpler form
-        logger.debug("FTS5 MATCH failed (%s), trying quoted phrase", e)
-        params_full[0] = f'"{safe_query}"'
-        try:
-            rows = conn.execute(sql, params_full).fetchall()
-        except Exception as e2:
-            logger.warning("FTS5 search failed: %s", e2)
-            return []
-
-    results = []
-    for row in rows:
-        results.append({
-            "content": row[1],
-            "doc_id": row[0],
-            "session_id": row[2],
-            "git_branch": row[3],
-            "turn_index": row[4],
-            "timestamp": row[5],
-            "chunk_type": row[6],
-            "distance": 0.0,  # placeholder for compatibility
-        })
-
-    if not _server_mode:
-        conn.close()
-
-    return results
-
-
-def rrf_merge(vector_results: List[Dict], fts_results: List[Dict],
-              n: int, k: int = 60) -> List[Dict]:
-    """Reciprocal Rank Fusion: merge two ranked lists.
-
-    score(doc) = sum(1 / (k + rank)) across both lists.
-    k=60 is the standard constant from the original RRF paper.
-    """
-    scores: Dict[str, float] = {}
-    docs: Dict[str, Dict] = {}
-
-    for rank, r in enumerate(vector_results):
-        doc_id = r["doc_id"]
-        scores[doc_id] = scores.get(doc_id, 0) + 1.0 / (k + rank + 1)
-        if doc_id not in docs:
-            docs[doc_id] = r
-
-    for rank, r in enumerate(fts_results):
-        doc_id = r["doc_id"]
-        scores[doc_id] = scores.get(doc_id, 0) + 1.0 / (k + rank + 1)
-        if doc_id not in docs:
-            docs[doc_id] = r
-
-    # Sort by combined RRF score descending
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-
-    merged = []
-    for doc_id, score in ranked[:n]:
-        result = docs[doc_id].copy()
-        result["_rrf_score"] = score
-        merged.append(result)
-
-    return merged
 
 
 def _get_persistent_client(db_path: str) -> MilvusClient:
@@ -439,10 +247,19 @@ def add_turns(turns: List[Dict], db_path: Optional[str] = None) -> int:
 
     # Dual-write into FTS5 sidecar
     try:
-        fts_conn = _get_fts_connection(db_path)
-        _fts_insert(fts_conn, new_turns)
-        if not _server_mode:
-            fts_conn.close()
+        if db_path:
+            fts_conn = _fts.connection(db_path)
+            fts_records = [{
+                "doc_id": t["doc_id"],
+                "content": t["text"],
+                "session_id": t.get("session_id", ""),
+                "git_branch": t.get("git_branch", ""),
+                "turn_index": t.get("turn_index", 0),
+                "timestamp": t.get("timestamp", ""),
+                "chunk_type": t.get("chunk_type", "turn"),
+            } for t in new_turns]
+            _fts.insert(fts_conn, fts_records)
+            _fts.close_ephemeral(fts_conn)
     except Exception as e:
         logger.warning("FTS insert failed (non-fatal): %s", e)
 
@@ -497,8 +314,12 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
             })
 
     # --- FTS5 keyword search ---
-    fts_results = fts_search(query, n=fetch_n, session_id=session_id,
-                             git_branch=git_branch, db_path=db_path)
+    fts_filters = {}
+    if session_id:
+        fts_filters["session_id"] = session_id
+    if git_branch:
+        fts_filters["git_branch"] = git_branch
+    fts_results = _fts.search(query, n=fetch_n, filters=fts_filters or None, db_path=db_path)
 
     # --- Merge with RRF ---
     if fts_results and vector_results:
@@ -712,11 +533,9 @@ def delete_by_session(session_id: str, db_path: Optional[str] = None) -> int:
     # Also delete from FTS
     try:
         if db_path:
-            conn = _get_fts_connection(db_path)
-            conn.execute("DELETE FROM turns_fts WHERE session_id = ?", (session_id,))
-            conn.commit()
-            if not _server_mode:
-                conn.close()
+            conn = _fts.connection(db_path)
+            _fts.delete(conn, "session_id", session_id)
+            _fts.close_ephemeral(conn)
     except Exception as e:
         logger.warning("FTS delete by session failed (non-fatal): %s", e)
 
@@ -740,11 +559,9 @@ def delete_by_branch(git_branch: str, db_path: Optional[str] = None) -> int:
     # Also delete from FTS
     try:
         if db_path:
-            conn = _get_fts_connection(db_path)
-            conn.execute("DELETE FROM turns_fts WHERE git_branch = ?", (git_branch,))
-            conn.commit()
-            if not _server_mode:
-                conn.close()
+            conn = _fts.connection(db_path)
+            _fts.delete(conn, "git_branch", git_branch)
+            _fts.close_ephemeral(conn)
     except Exception as e:
         logger.warning("FTS delete by branch failed (non-fatal): %s", e)
 
@@ -783,14 +600,9 @@ def delete_older_than(max_age_days: int, db_path: Optional[str] = None) -> int:
     # Also delete from FTS
     try:
         if db_path:
-            conn = _get_fts_connection(db_path)
-            conn.execute(
-                "DELETE FROM turns_fts WHERE timestamp < ? AND timestamp != ''",
-                (cutoff_str,),
-            )
-            conn.commit()
-            if not _server_mode:
-                conn.close()
+            conn = _fts.connection(db_path)
+            _fts.delete_where(conn, "timestamp < ? AND timestamp != ''", (cutoff_str,))
+            _fts.close_ephemeral(conn)
     except Exception as e:
         logger.warning("FTS delete older_than failed (non-fatal): %s", e)
 
@@ -806,19 +618,7 @@ def clear_collection(db_path: Optional[str] = None):
 
     # Clear FTS database
     if db_path:
-        fts_path = _fts_db_path(db_path)
-        # Close persistent connection if any
-        if fts_path in _persistent_fts:
-            try:
-                _persistent_fts[fts_path].close()
-            except Exception:
-                pass
-            del _persistent_fts[fts_path]
-        # Delete the FTS file
-        fts_file = Path(fts_path)
-        if fts_file.exists():
-            fts_file.unlink()
-            print(f"FTS database deleted: {fts_path}", file=sys.stderr)
+        _fts.clear(db_path)
 
 
 def list_sessions(db_path: Optional[str] = None) -> List[Dict]:
