@@ -20,8 +20,11 @@ import mlx.core as mx
 from contextlib import contextmanager
 from typing import List, Dict, Optional
 import asyncio
+import logging
 import sys
 import time
+
+logger = logging.getLogger("session-rag.milvus")
 
 # --- Embedding model ---
 
@@ -80,9 +83,12 @@ def init_server_mode():
 def close_server_mode():
     """Close all persistent clients and reset server mode."""
     global _write_lock, _embed_semaphore, _server_mode
-    for path, client in _persistent_clients.items():
-        client.close()
-        print(f"Closed client: {path}", file=sys.stderr)
+    for path, client in list(_persistent_clients.items()):
+        try:
+            client.close()
+            logger.info("Closed client: %s", path)
+        except Exception as e:
+            logger.warning("Error closing client %s: %s", path, e)
     _persistent_clients.clear()
     _write_lock = None
     _embed_semaphore = None
@@ -90,11 +96,27 @@ def close_server_mode():
 
 
 def _get_persistent_client(db_path: str) -> MilvusClient:
-    """Get or create a persistent client for the given DB path."""
-    if db_path not in _persistent_clients:
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    """Get or create a persistent client for the given DB path.
+    On failure, evicts the stale client and retries once."""
+    if db_path in _persistent_clients:
+        try:
+            _persistent_clients[db_path].has_collection(COLLECTION_NAME)
+            return _persistent_clients[db_path]
+        except Exception as e:
+            logger.warning("Stale Milvus client for %s: %s — reconnecting", db_path, e)
+            try:
+                _persistent_clients[db_path].close()
+            except Exception:
+                pass
+            del _persistent_clients[db_path]
+
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    try:
         _persistent_clients[db_path] = MilvusClient(db_path)
-        print(f"Opened client: {db_path}", file=sys.stderr)
+        logger.info("Opened client: %s", db_path)
+    except Exception as e:
+        logger.error("Failed to connect to Milvus at %s: %s", db_path, e)
+        raise
     return _persistent_clients[db_path]
 
 
@@ -181,8 +203,8 @@ def add_turns(turns: List[Dict], db_path: Optional[str] = None) -> int:
                 )
                 if results:
                     existing_ids.add(doc_id)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Dedup check failed for doc_id %s: %s", doc_id, e)
 
     new_turns = [t for t in turns if t["doc_id"] not in existing_ids]
     if not new_turns:

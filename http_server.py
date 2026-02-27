@@ -12,10 +12,12 @@ Health: curl http://127.0.0.1:7102/health
 
 import contextlib
 import json
+import logging
 import os
 import signal
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import uvicorn
@@ -31,6 +33,8 @@ import rag_engine
 import transcript_parser
 import file_watcher
 from tools import register_tools, set_current_project_root
+
+logger = logging.getLogger("session-rag")
 
 
 # --- Configuration ---
@@ -59,10 +63,24 @@ class ProjectMiddleware:
             project_root = headers.get(b"x-project-root", b"").decode("utf-8").strip()
             set_current_project_root(project_root if project_root else None)
 
-        await self.app(scope, receive, send)
+        try:
+            await self.app(scope, receive, send)
+        except Exception as exc:
+            logger.error("ASGI handler error: %s\n%s", exc, traceback.format_exc())
+            if scope["type"] == "http":
+                body = json.dumps({"error": "internal_server_error", "detail": str(exc)}).encode()
+                await send({"type": "http.response.start", "status": 500, "headers": [
+                    [b"content-type", b"application/json"],
+                    [b"content-length", str(len(body)).encode()],
+                ]})
+                await send({"type": "http.response.body", "body": body})
 
 
 # --- Health endpoint ---
+
+_model_loaded = False
+_server_mode_ready = False
+
 
 async def health(request: Request) -> JSONResponse:
     watchers = file_watcher.get_watcher_status()
@@ -70,6 +88,8 @@ async def health(request: Request) -> JSONResponse:
         "status": "ok",
         "server": "session-rag",
         "port": PORT,
+        "model": _model_loaded,
+        "milvus": _server_mode_ready,
         "watchers": {k: v for k, v in watchers.items()},
     })
 
@@ -233,15 +253,22 @@ async def lifespan(app: Starlette):
     PID_FILE.write_text(str(os.getpid()))
     print(f"[HTTP] PID {os.getpid()} written to {PID_FILE}", file=sys.stderr)
 
+    global _model_loaded, _server_mode_ready
+
     # Pre-load embedding model
     try:
         print("[HTTP] Pre-loading Nomic model...", file=sys.stderr)
         rag_engine.get_model()
+        _model_loaded = True
         print("[HTTP] Nomic model loaded.", file=sys.stderr)
     except Exception as e:
         print(f"[HTTP] Warning: Could not pre-load model: {e}", file=sys.stderr)
 
-    rag_engine.init_server_mode()
+    try:
+        rag_engine.init_server_mode()
+        _server_mode_ready = True
+    except Exception as e:
+        print(f"[HTTP] Warning: Could not init server mode: {e}", file=sys.stderr)
 
     async with session_manager.run():
         print(f"[HTTP] Server ready on http://{HOST}:{PORT}", file=sys.stderr)

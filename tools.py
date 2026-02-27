@@ -2,6 +2,7 @@
 MCP tool definitions and project context for session-rag.
 """
 
+import asyncio
 import contextvars
 from pathlib import Path
 from mcp.server import Server
@@ -325,5 +326,5 @@ def register_tools(server: Server):
             else:
                 raise ValueError(f"Unknown tool: {name}")
 
-        except Exception as e:
+        except (Exception, asyncio.CancelledError) as e:
             return [types.TextContent(type="text", text=f"Error executing {name}: {str(e)}")]
