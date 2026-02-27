@@ -62,7 +62,7 @@ echo "  Installing MLX embeddings..."
 pip install --quiet "mlx>=0.30.0" mlx-embeddings "transformers<5.0"
 
 echo "  Installing MCP + HTTP server..."
-pip install --quiet "mcp>=1.0.0" starlette uvicorn httpx
+pip install --quiet "mcp>=1.0.0" starlette uvicorn httpx "watchdog>=4.0.0"
 
 echo "  All dependencies installed"
 
@@ -83,6 +83,7 @@ sys.path.insert(0, '.')
 try:
     import rag_engine
     import transcript_parser
+    import file_watcher
     import tools
     print("  All imports successful")
 except Exception as e:
@@ -236,9 +237,9 @@ echo ""
 echo "Embedding model: ModernBERT Embed Base (768 dims, 8192 token ctx, MLX)"
 echo ""
 echo "Hooks installed in: ~/.claude/settings.json"
-echo "  - SessionStart: auto-start server + set session ID"
-echo "  - Stop: index new turns after each response"
-echo "  - PreCompact: index before context compaction"
+echo "  - SessionStart: auto-start server + register file watcher + backfill"
+echo "  - Stop: index final turns when session ends"
+echo "  - PreCompact: index turns before context compaction"
 echo ""
 echo "Next steps:"
 echo ""

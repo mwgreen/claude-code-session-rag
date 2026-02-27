@@ -7,3 +7,4 @@ mcp>=1.0.0
 starlette
 uvicorn
 httpx
+watchdog>=4.0.0

@@ -5,14 +5,21 @@ Embeds conversation turns with ModernBERT Embed Base (768 dims, 8192 token conte
 via mlx-embeddings. Stores vectors in Milvus Lite, one DB per project.
 """
 
+import os
+from pathlib import Path
+
+# Auto-enable offline mode if model is already cached (avoid network calls)
+# Must be set BEFORE importing mlx_embeddings which loads huggingface_hub
+_model_cache = Path.home() / ".cache/huggingface/hub/models--nomic-ai--modernbert-embed-base"
+if _model_cache.exists() and 'HF_HUB_OFFLINE' not in os.environ:
+    os.environ['HF_HUB_OFFLINE'] = '1'
+
 from pymilvus import MilvusClient, DataType, CollectionSchema, FieldSchema
 from mlx_embeddings.utils import load as mlx_load, generate as mlx_generate
 import mlx.core as mx
 from contextlib import contextmanager
-from pathlib import Path
 from typing import List, Dict, Optional
 import asyncio
-import os
 import sys
 import time
 

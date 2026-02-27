@@ -29,6 +29,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 import rag_engine
 import transcript_parser
+import file_watcher
 from tools import register_tools, set_current_project_root
 
 
@@ -64,7 +65,13 @@ class ProjectMiddleware:
 # --- Health endpoint ---
 
 async def health(request: Request) -> JSONResponse:
-    return JSONResponse({"status": "ok", "server": "session-rag", "port": PORT})
+    watchers = file_watcher.get_watcher_status()
+    return JSONResponse({
+        "status": "ok",
+        "server": "session-rag",
+        "port": PORT,
+        "watchers": {k: v for k, v in watchers.items()},
+    })
 
 
 # --- Index endpoint (called by hooks) ---
@@ -114,6 +121,9 @@ async def index_endpoint(request: Request) -> JSONResponse:
 
     db_path = str(Path(project_root) / ".session-rag" / "milvus.db")
 
+    # Ensure file watcher is running for this project
+    await file_watcher.ensure_watcher(project_root, db_path)
+
     # Load incremental state
     state = transcript_parser.load_index_state(project_root)
     offset = transcript_parser.get_transcript_offset(state, transcript_path)
@@ -155,6 +165,64 @@ async def index_endpoint(request: Request) -> JSONResponse:
     return JSONResponse({"indexed": count, "expired": expired, "session_id": session_id})
 
 
+# --- Watch endpoint (register project + backfill) ---
+
+async def watch_endpoint(request: Request) -> JSONResponse:
+    """Register a project for file watching and trigger backfill.
+
+    Called by SessionStart hook to ensure the watcher is running and
+    any missed sessions are indexed.
+
+    Project root comes from X-Project-Root header or JSON body.
+    """
+    # Determine project root from header
+    headers = dict(request.scope.get("headers", []))
+    project_root = headers.get(b"x-project-root", b"").decode("utf-8").strip()
+
+    if not project_root:
+        try:
+            body = await request.json()
+            project_root = body.get("project_root", "") or body.get("cwd", "")
+        except Exception:
+            pass
+
+    if not project_root:
+        return JSONResponse(
+            {"error": "Project root required (X-Project-Root header or project_root in body)"},
+            status_code=400,
+        )
+
+    db_path = str(Path(project_root) / ".session-rag" / "milvus.db")
+
+    # Ensure watcher is running
+    watcher = await file_watcher.ensure_watcher(project_root, db_path)
+
+    # Trigger backfill in the background
+    backfilled = 0
+    if watcher is not None:
+        backfilled = await watcher.backfill()
+
+    # Auto-expiry check
+    expired = 0
+    if AUTO_EXPIRE_DAYS > 0:
+        state = transcript_parser.load_index_state(project_root)
+        last_expire = state.get("last_expire_check", 0)
+        now = time.time()
+        if now - last_expire > _EXPIRE_CHECK_INTERVAL:
+            expired = rag_engine.delete_older_than(AUTO_EXPIRE_DAYS, db_path=db_path)
+            state["last_expire_check"] = now
+            transcript_parser.save_index_state(project_root, state)
+            if expired > 0:
+                print(f"[expire] Pruned {expired} turns older than {AUTO_EXPIRE_DAYS} days",
+                      file=sys.stderr)
+
+    return JSONResponse({
+        "watching": project_root,
+        "backfilled": backfilled,
+        "expired": expired,
+    })
+
+
 # --- Lifespan ---
 
 @contextlib.asynccontextmanager
@@ -182,6 +250,7 @@ async def lifespan(app: Starlette):
         finally:
             pass
 
+    await file_watcher.stop_all_watchers()
     rag_engine.close_server_mode()
     if PID_FILE.exists():
         PID_FILE.unlink()
@@ -215,6 +284,7 @@ app = Starlette(
     routes=[
         Route("/health", health, methods=["GET"]),
         Route("/index", index_endpoint, methods=["POST"]),
+        Route("/watch", watch_endpoint, methods=["POST"]),
         Mount("/mcp", app=ProjectMiddleware(session_manager.handle_request)),
     ],
     lifespan=lifespan,

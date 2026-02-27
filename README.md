@@ -8,7 +8,8 @@ Claude Code compresses older messages when conversations get long. Once compress
 
 - **Embedding model**: ModernBERT Embed Base (768 dims, 8192 token context) via `mlx-embeddings` on Apple Silicon
 - **Vector store**: Milvus Lite (per-project DB at `{project}/.session-rag/milvus.db`)
-- **Indexing**: Hook-driven — Stop and PreCompact hooks trigger incremental indexing
+- **Indexing**: File watcher (watchdog) monitors transcript files in real time, plus Stop/PreCompact hooks as backup
+- **Backfill**: On session start, automatically indexes any transcripts that were missed
 - **Server**: HTTP MCP server on port 7102
 - **Memory**: ~350-400 MB model footprint
 
@@ -30,6 +31,7 @@ Claude Code compresses older messages when conversations get long. Once compress
 |------|-------------|
 | `search_session` | Search conversation history with recency bias. Pass `session_id` to scope to current session. |
 | `search_all_sessions` | Cross-session search, pure semantic. Optional git branch filter. |
+| `get_turns` | Retrieve conversation turns around a specific turn index. |
 | `get_session_stats` | Index statistics: turn count, session count, branches. |
 | `cleanup_sessions` | Delete old session data by age, session ID, or git branch. |
 
@@ -57,7 +59,7 @@ cd /path/to/claude-code-session-rag
 ./setup.sh
 ```
 
-This creates a venv, installs dependencies, downloads the model, and installs hooks into `~/.claude/settings.json`.
+This creates a venv, installs dependencies (including watchdog), downloads the model, and installs hooks into `~/.claude/settings.json`.
 
 ### Step 2: Configure MCP
 
@@ -79,7 +81,7 @@ Add to each project's `.mcp.json`:
 
 ### Step 3: Restart Claude Code
 
-The SessionStart hook will auto-start the server on next session.
+The SessionStart hook will auto-start the server and register the file watcher.
 
 ### What setup.sh installs
 
@@ -87,8 +89,8 @@ Hooks are added to `~/.claude/settings.json` (merged safely with existing hooks)
 
 | Hook | What it does |
 |------|-------------|
-| **SessionStart** | Starts the server + sets `$CLAUDE_SESSION_ID` env var |
-| **Stop** | Indexes new transcript turns after each response |
+| **SessionStart** | Starts the server + registers file watcher + backfills missed sessions |
+| **Stop** | Indexes final turns when session ends |
 | **PreCompact** | Indexes turns before context compaction |
 
 ## Architecture
@@ -97,11 +99,17 @@ Hooks are added to `~/.claude/settings.json` (merged safely with existing hooks)
 Claude Code Session
     │
     ├── SessionStart hook ──► session-rag-server.sh start
-    │                     └──► session_start_hook.sh (sets $CLAUDE_SESSION_ID)
+    │                     └──► session_start_hook.sh
+    │                           ├── sets $CLAUDE_SESSION_ID
+    │                           └── POST /watch (register watcher + backfill)
     │
-    ├── Stop hook ──────────► index_hook.py ──POST──► session-rag server
+    ├── [real-time] ────────── file_watcher.py (watchdog)
+    │                           watches ~/.claude/projects/{slug}/*.jsonl
+    │                           debounce 2s → parse new bytes → embed → index
     │
-    ├── PreCompact hook ────► index_hook.py ──POST──► session-rag server
+    ├── Stop hook ──────────► index_hook.py ──POST──► /index (final flush)
+    │
+    ├── PreCompact hook ────► index_hook.py ──POST──► /index
     │
     └── MCP tools ──────────────────────────────────► session-rag server
                                                         │
@@ -114,6 +122,14 @@ Claude Code Session
                                                         └── .session-rag/milvus.db
                                                             (per-project vector DB)
 ```
+
+### Indexing Pipeline
+
+1. **File watcher** (primary): watchdog monitors the transcript directory. When a `.jsonl` file is modified, the change is debounced (2s default) then the server reads from the last known byte offset to the end of file, parses new turns, and indexes them. Nothing is lost during debouncing — the byte offset ensures all content is captured.
+
+2. **Hook-based** (backup): Stop and PreCompact hooks POST to `/index` with the transcript path. Same incremental byte-offset logic. These serve as a safety net if the watcher misses something.
+
+3. **Backfill** (startup): On each SessionStart, the hook POSTs to `/watch` which scans all transcript files and indexes any that are behind their byte offset. This catches sessions missed due to server downtime.
 
 ### What Gets Indexed
 
@@ -129,11 +145,22 @@ Claude Code Session
 
 ### Incremental Indexing
 
-Each transcript is tracked by byte offset in `.session-rag/index_state.json`. On each hook invocation, only new lines since the last index are processed. This makes indexing fast even for long sessions.
+Each transcript is tracked by byte offset in `.session-rag/index_state.json`. Only new bytes since the last index are processed. The server owns this state file exclusively — no more race conditions from concurrent hook processes.
 
 ### Auto-Expiry
 
-The index hook automatically prunes turns older than 30 days (checked once per day). Configure via the `SESSION_RAG_EXPIRE_DAYS` environment variable, or set to `0` to disable.
+Turns older than 365 days are pruned automatically (checked once per day). Configure via the `SESSION_RAG_EXPIRE_DAYS` environment variable, or set to `0` to disable.
+
+## Configuration
+
+Environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SESSION_RAG_PORT` | `7102` | HTTP server port |
+| `SESSION_RAG_EXPIRE_DAYS` | `365` | Auto-prune turns older than this |
+| `SESSION_RAG_WATCH` | `true` | Enable/disable file watcher |
+| `SESSION_RAG_WATCH_DEBOUNCE` | `2.0` | Seconds to wait after last file change before indexing |
 
 ## Data Management
 
@@ -177,6 +204,11 @@ cleanup_sessions(session_id="abc123-...")
 ./session-rag-server.sh restart  # Stop + start
 ```
 
+Health check (includes watcher status):
+```bash
+curl http://127.0.0.1:7102/health
+```
+
 Logs: `~/.session-rag/server.log`
 PID: `~/.session-rag/server.pid`
 
@@ -185,11 +217,12 @@ PID: `~/.session-rag/server.pid`
 ```
 claude-code-session-rag/
 ├── http_server.py          # HTTP MCP server (port 7102)
+├── file_watcher.py         # Watchdog-based transcript file watcher
 ├── tools.py                # MCP tool definitions
 ├── rag_engine.py           # ModernBERT embedding + Milvus operations
 ├── transcript_parser.py    # Parse JSONL transcripts into turns
 ├── index_hook.py           # Hook entry point (stdin → POST)
-├── session_start_hook.sh   # SessionStart hook (sets $CLAUDE_SESSION_ID)
+├── session_start_hook.sh   # SessionStart hook (env var + register watcher)
 ├── cleanup.py              # CLI data management tool
 ├── session-rag-server.sh   # Server lifecycle script
 ├── setup.sh                # Installation script (installs hooks too)
@@ -205,5 +238,5 @@ Runtime files:
 ~/.session-rag/server.pid           # Server PID
 ~/.session-rag/server.log           # Server logs
 {project}/.session-rag/milvus.db    # Vector DB (per-project)
-{project}/.session-rag/index_state.json  # Indexing progress
+{project}/.session-rag/index_state.json  # Indexing progress (byte offsets)
 ```
