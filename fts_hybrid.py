@@ -22,7 +22,7 @@ Usage:
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 logger = logging.getLogger("fts-hybrid")
 
@@ -32,17 +32,27 @@ class FTSIndex:
 
     Args:
         table_name: FTS5 virtual table name (e.g. "turns_fts", "chunks_fts")
-        metadata_columns: UNINDEXED column names beyond doc_id and content
+        metadata_columns: Column names beyond doc_id and content
+        indexed_metadata: Set of metadata column names that should be full-text indexed
+            (searchable via MATCH). All others are UNINDEXED (stored but not searchable).
     """
 
-    def __init__(self, table_name: str, metadata_columns: List[str]):
+    def __init__(self, table_name: str, metadata_columns: List[str],
+                 indexed_metadata: Optional[Set[str]] = None):
         self.table_name = table_name
         self.metadata_columns = metadata_columns
+        self._indexed_metadata = indexed_metadata or set()
         self._connections: Dict[str, sqlite3.Connection] = {}
         self._server_mode = False
 
         # Pre-compute SQL fragments
-        meta_defs = ", ".join(f"{col} UNINDEXED" for col in metadata_columns)
+        meta_defs_parts = []
+        for col in metadata_columns:
+            if col in self._indexed_metadata:
+                meta_defs_parts.append(col)  # indexed (searchable)
+            else:
+                meta_defs_parts.append(f"{col} UNINDEXED")
+        meta_defs = ", ".join(meta_defs_parts)
         self._create_sql = (
             f"CREATE VIRTUAL TABLE IF NOT EXISTS {table_name} USING fts5("
             f"doc_id, content, {meta_defs})"
@@ -50,8 +60,11 @@ class FTSIndex:
         all_cols = ["doc_id", "content"] + metadata_columns
         self._insert_cols = ", ".join(all_cols)
         self._insert_placeholders = ", ".join("?" for _ in all_cols)
-        # bm25 weights: 0 for doc_id, 1 for content, 0 for each metadata
-        bm25_weights = ", ".join(["0", "1"] + ["0"] * len(metadata_columns))
+        # bm25 weights: 0 for doc_id, 1.0 for content, 0.5 for indexed metadata, 0 for unindexed
+        bm25_parts = ["0", "1"]  # doc_id, content
+        for col in metadata_columns:
+            bm25_parts.append("0.5" if col in self._indexed_metadata else "0")
+        bm25_weights = ", ".join(bm25_parts)
         self._select_cols = ", ".join(all_cols)
         self._bm25_call = f"bm25({table_name}, {bm25_weights})"
 
@@ -73,6 +86,43 @@ class FTSIndex:
         """Derive the FTS database path from the Milvus DB path."""
         return str(Path(milvus_db_path).parent / "fts.db")
 
+    def _check_and_migrate(self, conn: sqlite3.Connection):
+        """Check schema version and recreate FTS table if needed.
+
+        Stores the CREATE SQL in a _fts_schema table. If the schema changes
+        (e.g. column added or UNINDEXED -> indexed), drops and recreates the
+        FTS table. Data will be rebuilt organically via file watcher.
+        """
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS _fts_schema (
+                table_name TEXT PRIMARY KEY,
+                create_sql TEXT NOT NULL
+            )
+        """)
+
+        row = conn.execute(
+            "SELECT create_sql FROM _fts_schema WHERE table_name = ?",
+            (self.table_name,)
+        ).fetchone()
+
+        if row and row[0] == self._create_sql:
+            # Schema matches — just ensure table exists
+            conn.execute(self._create_sql)
+            conn.commit()
+            return
+
+        if row:
+            # Schema changed — drop and recreate
+            logger.info("FTS schema changed for %s, rebuilding...", self.table_name)
+            conn.execute(f"DROP TABLE IF EXISTS {self.table_name}")
+
+        conn.execute(self._create_sql)
+        conn.execute(
+            "INSERT OR REPLACE INTO _fts_schema (table_name, create_sql) VALUES (?, ?)",
+            (self.table_name, self._create_sql)
+        )
+        conn.commit()
+
     def connection(self, milvus_db_path: str) -> sqlite3.Connection:
         """Get or create a connection. Persistent in server mode, ephemeral otherwise."""
         fts_path = self.db_path(milvus_db_path)
@@ -92,8 +142,7 @@ class FTSIndex:
         Path(fts_path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(fts_path)
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(self._create_sql)
-        conn.commit()
+        self._check_and_migrate(conn)
 
         if self._server_mode:
             self._connections[fts_path] = conn
@@ -218,6 +267,11 @@ class FTSIndex:
         if fts_file.exists():
             fts_file.unlink()
             logger.info("FTS database deleted: %s", fts_path)
+        # Also clean up WAL/SHM files
+        for suffix in ("-wal", "-shm"):
+            wal = Path(fts_path + suffix)
+            if wal.exists():
+                wal.unlink()
 
 
 def rrf_merge(vector_results: List[Dict], fts_results: List[Dict],

@@ -18,25 +18,12 @@ _current_project_root: contextvars.ContextVar[str | None] = contextvars.ContextV
 )
 
 
-class ProjectNotConfiguredError(Exception):
-    pass
-
-
-_PROJECT_ERROR_MSG = (
-    "No project configured. Add to your .mcp.json:\n"
-    '  "headers": {"X-Project-Root": "/path/to/your/project"}'
-)
-
-
 def set_current_project_root(root: str | None):
     _current_project_root.set(root)
 
 
-def get_current_project_root() -> str:
-    root = _current_project_root.get()
-    if root is None:
-        raise ProjectNotConfiguredError(_PROJECT_ERROR_MSG)
-    return root
+def get_current_project_root() -> str | None:
+    return _current_project_root.get()
 
 
 def get_db_path() -> str:
@@ -270,12 +257,7 @@ def register_tools(server: Server):
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         db = get_db_path()
-
-        # Resolve project_root for scoping
-        try:
-            current_project = get_current_project_root()
-        except ProjectNotConfiguredError:
-            current_project = None
+        current_project = get_current_project_root()
 
         try:
             if name == "search_session":

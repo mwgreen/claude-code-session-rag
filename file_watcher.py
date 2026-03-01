@@ -1,18 +1,17 @@
 """
-File watcher for automatic transcript indexing.
+Global file watcher for automatic transcript indexing.
 
-Uses macOS FSEvents (via watchdog) to detect .jsonl transcript changes and
-index new turns in real time. When a transcript file grows (new turns written
-by Claude Code), the watcher debounces briefly then reads from the last known
-byte offset — nothing is lost, just batched.
+Uses macOS FSEvents (via watchdog) to monitor ~/.claude/projects/ for all
+transcript changes across every project. A single Observer handles everything.
 
 Pipeline: FSEvents -> watchdog thread -> asyncio.Queue -> debounce -> incremental parse + index
 
-The server owns index_state.json exclusively — no more race conditions from
-concurrent hook processes.
+Slug→root mapping is persisted at ~/.session-rag/slug_map.json, populated by
+/watch and /index hooks. Unknown slugs get project_root="" until a hook registers them.
 """
 
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -32,9 +31,80 @@ _watcher_config = {
     'debounce_seconds': float(os.getenv('SESSION_RAG_WATCH_DEBOUNCE', '2.0')),
 }
 
+_CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+_SLUG_MAP_PATH = Path.home() / ".session-rag" / "slug_map.json"
+
 
 def _log(msg: str):
     print(f"[watcher] {msg}", file=sys.stderr)
+
+
+# --- Slug <-> project root mapping ---
+
+_slug_map: Dict[str, str] = {}  # slug -> project_root
+
+
+def _load_slug_map():
+    """Load persisted slug→root mapping."""
+    global _slug_map
+    if _SLUG_MAP_PATH.exists():
+        try:
+            with open(_SLUG_MAP_PATH) as f:
+                _slug_map = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            _slug_map = {}
+
+
+def _save_slug_map():
+    """Persist slug→root mapping."""
+    _SLUG_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_SLUG_MAP_PATH, "w") as f:
+        json.dump(_slug_map, f, indent=2)
+
+
+def _project_root_to_slug(project_root: str) -> str:
+    """Convert a project root path to its Claude Code slug.
+
+    Claude Code slugs: absolute path with / and . replaced by -.
+    e.g., /Users/matt/project -> -Users-matt-project
+    """
+    return project_root.replace("/", "-").replace(".", "-")
+
+
+def _slug_from_transcript_path(transcript_path: str) -> Optional[str]:
+    """Extract the slug directory name from a transcript path.
+
+    Transcript paths are like:
+      ~/.claude/projects/{slug}/{session_id}.jsonl
+    """
+    try:
+        path = Path(transcript_path)
+        projects_str = str(_CLAUDE_PROJECTS)
+        path_str = str(path.parent)
+        if path_str.startswith(projects_str):
+            relative = path_str[len(projects_str):].strip("/")
+            # The slug is the first path component
+            return relative.split("/")[0] if relative else None
+    except Exception:
+        pass
+    return None
+
+
+def register_project(project_root: str):
+    """Register a project root, recording its slug→root mapping.
+
+    Called by /watch and /index hooks when they know the real project root.
+    """
+    slug = _project_root_to_slug(project_root)
+    if slug not in _slug_map or _slug_map[slug] != project_root:
+        _slug_map[slug] = project_root
+        _save_slug_map()
+        _log(f"Registered slug {slug} -> {project_root}")
+
+
+def _get_project_root_for_slug(slug: str) -> str:
+    """Look up the project root for a slug. Returns "" if unknown."""
+    return _slug_map.get(slug, "")
 
 
 # --- TranscriptChangeHandler ---
@@ -49,11 +119,9 @@ class TranscriptChangeHandler(FileSystemEventHandler):
         self.loop = loop
 
     def _should_handle(self, path: str) -> bool:
-        """Only handle .jsonl files (Claude Code transcripts)."""
         return path.endswith('.jsonl')
 
     def _enqueue(self, path: str):
-        """Thread-safe enqueue to asyncio loop."""
         try:
             self.loop.call_soon_threadsafe(
                 self.change_queue.put_nowait, path
@@ -70,14 +138,12 @@ class TranscriptChangeHandler(FileSystemEventHandler):
             self._enqueue(event.src_path)
 
 
-# --- TranscriptWatcher ---
+# --- GlobalTranscriptWatcher ---
 
-class TranscriptWatcher:
-    """Watches Claude Code transcript directories and indexes new turns."""
+class GlobalTranscriptWatcher:
+    """Watches ~/.claude/projects/ recursively and indexes new turns from all projects."""
 
-    def __init__(self, project_root: str, db_path: str,
-                 debounce_seconds: float = 2.0):
-        self.project_root = project_root
+    def __init__(self, db_path: str, debounce_seconds: float = 2.0):
         self.db_path = db_path
         self.debounce_seconds = debounce_seconds
 
@@ -95,63 +161,27 @@ class TranscriptWatcher:
             'errors': 0,
         }
 
-    def _get_transcript_dir(self) -> Optional[str]:
-        """Derive the Claude Code transcript directory for this project.
-
-        Claude stores transcripts at:
-          ~/.claude/projects/{slug}/{session_id}.jsonl
-        where slug is the project root absolute path with / and . replaced by -.
-        """
-        claude_projects = Path.home() / ".claude" / "projects"
-        if not claude_projects.is_dir():
-            return None
-
-        # Claude Code slug: replace / and . with -
-        slug = self.project_root.replace("/", "-").replace(".", "-")
-        transcript_dir = claude_projects / slug
-        if transcript_dir.is_dir():
-            return str(transcript_dir)
-
-        # Also try without leading dash
-        slug_no_lead = slug.lstrip("-")
-        transcript_dir = claude_projects / slug_no_lead
-        if transcript_dir.is_dir():
-            return str(transcript_dir)
-
-        # Fallback: scan directories for one that contains this project path
-        # (handles unknown slug transformations)
-        normalized = self.project_root.rstrip("/").lower()
-        for d in claude_projects.iterdir():
-            if not d.is_dir():
-                continue
-            # Reconstruct path from slug: leading dash = /, internal dashes = / or .
-            # Check if slug matches by comparing normalized forms
-            candidate = d.name.replace("-", "/").lower()
-            if candidate == normalized or candidate == "/" + normalized:
-                return str(d)
-
-        return None
-
     async def start(self):
-        """Start watching the transcript directory."""
-        transcript_dir = self._get_transcript_dir()
-        if not transcript_dir:
-            _log(f"No transcript directory found for {self.project_root}")
+        """Start watching ~/.claude/projects/ recursively."""
+        if not _CLAUDE_PROJECTS.is_dir():
+            _log(f"No Claude projects directory at {_CLAUDE_PROJECTS}")
             return
 
         loop = asyncio.get_event_loop()
         handler = TranscriptChangeHandler(self._change_queue, loop)
 
         self._observer = Observer()
-        self._observer.schedule(handler, transcript_dir, recursive=False)
+        self._observer.schedule(handler, str(_CLAUDE_PROJECTS), recursive=True)
         self._observer.daemon = True
         self._observer.start()
 
         self._drain_task = asyncio.create_task(self._drain_queue())
 
-        n_files = len(list(Path(transcript_dir).glob("*.jsonl")))
-        _log(f"Watching {transcript_dir} ({n_files} transcripts, "
-             f"debounce={self.debounce_seconds}s)")
+        # Count total transcript files across all project slug dirs
+        n_files = sum(1 for _ in _CLAUDE_PROJECTS.rglob("*.jsonl"))
+        n_slugs = sum(1 for d in _CLAUDE_PROJECTS.iterdir() if d.is_dir())
+        _log(f"Watching {_CLAUDE_PROJECTS} ({n_slugs} project dirs, "
+             f"{n_files} transcripts, debounce={self.debounce_seconds}s)")
 
     async def stop(self):
         """Stop the watcher and cancel pending work."""
@@ -189,7 +219,6 @@ class TranscriptWatcher:
             pass
 
     def _reset_debounce(self):
-        """Reset the debounce timer. Called each time a new event arrives."""
         if self._debounce_handle is not None:
             self._debounce_handle.cancel()
 
@@ -200,15 +229,11 @@ class TranscriptWatcher:
         )
 
     async def _trigger_processing(self):
-        """Called when debounce timer fires."""
         if self._stopped:
             return
-
-        # Don't start a new batch while one is processing
         if self._processing:
             self._reset_debounce()
             return
-
         await self._process_batch()
 
     async def _process_batch(self):
@@ -226,14 +251,14 @@ class TranscriptWatcher:
         errors = 0
 
         try:
-            # Load state once for the whole batch
-            state = transcript_parser.load_index_state(self.project_root)
+            state = transcript_parser.load_index_state()
 
             for transcript_path in batch:
                 if not Path(transcript_path).exists():
                     continue
 
-                # Extract session_id from filename (uuid.jsonl)
+                slug = _slug_from_transcript_path(transcript_path)
+                project_root = _get_project_root_for_slug(slug) if slug else ""
                 session_id = Path(transcript_path).stem
 
                 offset = transcript_parser.get_transcript_offset(
@@ -246,25 +271,23 @@ class TranscriptWatcher:
 
                     if turns:
                         for t in turns:
-                            t["project_root"] = self.project_root
-                        loop = asyncio.get_event_loop()
+                            t["project_root"] = project_root
                         count = await rag_engine.add_turns_async(
                             turns, db_path=self.db_path)
                         total_indexed += count
                         _log(f"Indexed {count} turns from "
                              f"{Path(transcript_path).name} "
-                             f"(session {session_id})")
+                             f"(session {session_id[:8]})")
 
-                    # Always advance offset (even if no turns — skip tool_results etc)
                     transcript_parser.set_transcript_offset(
-                        state, transcript_path, new_offset)
+                        state, transcript_path, new_offset,
+                        project_root=project_root)
 
                 except Exception as e:
                     _log(f"Error indexing {Path(transcript_path).name}: {e}")
                     errors += 1
 
-            # Save state once after the whole batch
-            transcript_parser.save_index_state(self.project_root, state)
+            transcript_parser.save_index_state(state)
 
             self.stats['turns_indexed'] += total_indexed
             self.stats['files_processed'] += len(batch)
@@ -276,40 +299,54 @@ class TranscriptWatcher:
             self.stats['errors'] += 1
         finally:
             self._processing = False
-            # If more changes accumulated during processing, trigger again
             if self._pending_files:
                 self._reset_debounce()
 
-    async def backfill(self):
+    async def backfill(self, slug_filter: Optional[str] = None):
         """Index all unindexed or partially-indexed transcript files.
 
-        Called on startup to catch sessions that were missed (server wasn't
-        running, race conditions, etc).
+        If slug_filter is provided, only backfill that slug's directory.
+        Otherwise, backfill ALL project slug directories.
         """
-        transcript_dir = self._get_transcript_dir()
-        if not transcript_dir:
+        if not _CLAUDE_PROJECTS.is_dir():
             return 0
 
-        state = transcript_parser.load_index_state(self.project_root)
-        transcripts = list(Path(transcript_dir).glob("*.jsonl"))
+        state = transcript_parser.load_index_state()
+
+        # Collect all transcript files to check
+        if slug_filter:
+            slug_dir = _CLAUDE_PROJECTS / slug_filter
+            if slug_dir.is_dir():
+                transcripts = list(slug_dir.glob("*.jsonl"))
+            else:
+                return 0
+        else:
+            transcripts = list(_CLAUDE_PROJECTS.rglob("*.jsonl"))
 
         needs_indexing = []
         for t in transcripts:
             path = str(t)
             offset = transcript_parser.get_transcript_offset(state, path)
-            file_size = t.stat().st_size
+            try:
+                file_size = t.stat().st_size
+            except OSError:
+                continue
             if offset < file_size:
-                needs_indexing.append((path, t.stem, offset))
+                slug = _slug_from_transcript_path(path)
+                project_root = _get_project_root_for_slug(slug) if slug else ""
+                needs_indexing.append((path, t.stem, offset, project_root))
 
         if not needs_indexing:
-            _log(f"Backfill: all {len(transcripts)} transcripts up to date")
+            scope = slug_filter or "all projects"
+            _log(f"Backfill ({scope}): all {len(transcripts)} transcripts up to date")
             return 0
 
-        _log(f"Backfill: {len(needs_indexing)} of {len(transcripts)} "
+        scope = slug_filter or "all projects"
+        _log(f"Backfill ({scope}): {len(needs_indexing)} of {len(transcripts)} "
              f"transcripts need indexing...")
 
         total_indexed = 0
-        for transcript_path, session_id, offset in needs_indexing:
+        for transcript_path, session_id, offset, project_root in needs_indexing:
             try:
                 turns, new_offset = transcript_parser.parse_transcript(
                     transcript_path, session_id, start_offset=offset
@@ -317,13 +354,14 @@ class TranscriptWatcher:
 
                 if turns:
                     for t in turns:
-                        t["project_root"] = self.project_root
+                        t["project_root"] = project_root
                     count = await rag_engine.add_turns_async(
                         turns, db_path=self.db_path)
                     total_indexed += count
 
                 transcript_parser.set_transcript_offset(
-                    state, transcript_path, new_offset)
+                    state, transcript_path, new_offset,
+                    project_root=project_root)
 
             except Exception as e:
                 _log(f"Backfill error {Path(transcript_path).name}: {e}")
@@ -331,49 +369,59 @@ class TranscriptWatcher:
             # Yield control periodically
             await asyncio.sleep(0)
 
-        transcript_parser.save_index_state(self.project_root, state)
-        _log(f"Backfill complete: {total_indexed} turns indexed from "
+        transcript_parser.save_index_state(state)
+        _log(f"Backfill ({scope}) complete: {total_indexed} turns indexed from "
              f"{len(needs_indexing)} transcripts")
         return total_indexed
 
 
-# --- Watcher Manager ---
+# --- Global watcher singleton ---
 
-_watchers: Dict[str, TranscriptWatcher] = {}
+_global_watcher: Optional[GlobalTranscriptWatcher] = None
 
 
-async def ensure_watcher(project_root: str, db_path: str) -> Optional[TranscriptWatcher]:
-    """Ensure a watcher exists for the given project. Creates one if needed.
-    Returns None if watching is disabled."""
+async def start_global_watcher(db_path: str) -> Optional[GlobalTranscriptWatcher]:
+    """Start the single global watcher. Called once at server startup."""
+    global _global_watcher
     if not _watcher_config['enabled']:
         return None
-    if project_root in _watchers:
-        return _watchers[project_root]
+    if _global_watcher is not None:
+        return _global_watcher
 
-    watcher = TranscriptWatcher(
-        project_root=project_root,
+    _load_slug_map()
+
+    watcher = GlobalTranscriptWatcher(
         db_path=db_path,
         debounce_seconds=_watcher_config['debounce_seconds'],
     )
     await watcher.start()
-    _watchers[project_root] = watcher
+    _global_watcher = watcher
     return watcher
 
 
-async def stop_all_watchers():
-    """Stop all active watchers. Called during server shutdown."""
-    for watcher in list(_watchers.values()):
-        await watcher.stop()
-    _watchers.clear()
+async def stop_global_watcher():
+    """Stop the global watcher. Called during server shutdown."""
+    global _global_watcher
+    if _global_watcher is not None:
+        await _global_watcher.stop()
+        _global_watcher = None
 
 
 def get_watcher_status() -> Dict:
-    """Return status of all active watchers."""
+    """Return status of the global watcher."""
+    if _global_watcher is None:
+        return {}
     return {
-        root: {
-            'pending': len(w._pending_files),
-            'processing': w._processing,
-            'stats': dict(w.stats),
+        'global': {
+            'watching': str(_CLAUDE_PROJECTS),
+            'pending': len(_global_watcher._pending_files),
+            'processing': _global_watcher._processing,
+            'stats': dict(_global_watcher.stats),
+            'registered_projects': len(_slug_map),
         }
-        for root, w in _watchers.items()
     }
+
+
+def get_global_watcher() -> Optional[GlobalTranscriptWatcher]:
+    """Get the global watcher instance (for backfill triggers etc)."""
+    return _global_watcher

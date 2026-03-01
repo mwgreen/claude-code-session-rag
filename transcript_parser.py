@@ -248,24 +248,84 @@ def _build_turn(
 
 # --- Index state management ---
 
-def load_index_state(project_root: str) -> Dict:
-    """Load index state tracking file."""
-    state_path = Path(project_root) / ".session-rag" / "index_state.json"
-    if state_path.exists():
+_STATE_DIR = Path.home() / ".session-rag"
+_STATE_PATH = _STATE_DIR / "index_state.json"
+_migrated = False
+
+
+def _migrate_per_project_states(state: Dict):
+    """One-time migration: merge per-project index_state.json files into the global state."""
+    global _migrated
+    if _migrated:
+        return
+    _migrated = True
+
+    # Known per-project state locations
+    claude_projects = Path.home() / ".claude" / "projects"
+    if not claude_projects.is_dir():
+        return
+
+    # Scan for any .session-rag/index_state.json under common project roots
+    home = Path.home()
+    candidates = []
+    for idea_dir in [home / "IdeaProjects"]:
+        if idea_dir.is_dir():
+            for project_dir in idea_dir.iterdir():
+                state_file = project_dir / ".session-rag" / "index_state.json"
+                if state_file.exists():
+                    candidates.append((str(project_dir), state_file))
+
+    if not candidates:
+        return
+
+    transcripts = state.setdefault("transcripts", {})
+    merged_count = 0
+
+    for project_root, state_file in candidates:
         try:
-            with open(state_path) as f:
-                return json.load(f)
+            with open(state_file) as f:
+                old_state = json.load(f)
         except (json.JSONDecodeError, IOError):
-            return {}
-    return {}
+            continue
+
+        old_transcripts = old_state.get("transcripts", {})
+        for tpath, tdata in old_transcripts.items():
+            if tpath not in transcripts:
+                # Add project_root to the migrated entry
+                entry = dict(tdata)
+                entry["project_root"] = project_root
+                transcripts[tpath] = entry
+                merged_count += 1
+
+        # Preserve the latest expire check
+        old_expire = old_state.get("last_expire_check", 0)
+        if old_expire > state.get("last_expire_check", 0):
+            state["last_expire_check"] = old_expire
+
+    if merged_count:
+        import sys
+        print(f"[state] Migrated {merged_count} transcript entries from "
+              f"{len(candidates)} per-project states", file=sys.stderr)
 
 
-def save_index_state(project_root: str, state: Dict):
-    """Save index state tracking file."""
-    state_dir = Path(project_root) / ".session-rag"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    state_path = state_dir / "index_state.json"
-    with open(state_path, "w") as f:
+def load_index_state() -> Dict:
+    """Load centralized index state from ~/.session-rag/index_state.json."""
+    state = {}
+    if _STATE_PATH.exists():
+        try:
+            with open(_STATE_PATH) as f:
+                state = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            state = {}
+
+    _migrate_per_project_states(state)
+    return state
+
+
+def save_index_state(state: Dict):
+    """Save centralized index state to ~/.session-rag/index_state.json."""
+    _STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(_STATE_PATH, "w") as f:
         json.dump(state, f, indent=2)
 
 
@@ -274,10 +334,13 @@ def get_transcript_offset(state: Dict, transcript_path: str) -> int:
     return state.get("transcripts", {}).get(transcript_path, {}).get("last_byte_offset", 0)
 
 
-def set_transcript_offset(state: Dict, transcript_path: str, offset: int):
+def set_transcript_offset(state: Dict, transcript_path: str, offset: int,
+                          project_root: str = ""):
     """Update the byte offset for a transcript file."""
     if "transcripts" not in state:
         state["transcripts"] = {}
     if transcript_path not in state["transcripts"]:
         state["transcripts"][transcript_path] = {}
     state["transcripts"][transcript_path]["last_byte_offset"] = offset
+    if project_root:
+        state["transcripts"][transcript_path]["project_root"] = project_root

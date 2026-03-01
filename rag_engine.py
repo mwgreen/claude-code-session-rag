@@ -14,11 +14,10 @@ import hashlib
 import os
 from pathlib import Path
 
-# Auto-enable offline mode if model is already cached (avoid network calls)
-# Must be set BEFORE importing mlx_embeddings which loads huggingface_hub
-_model_cache = Path.home() / ".cache/huggingface/hub/models--nomic-ai--modernbert-embed-base"
-if _model_cache.exists() and 'HF_HUB_OFFLINE' not in os.environ:
-    os.environ['HF_HUB_OFFLINE'] = '1'
+# Block all HuggingFace network access at runtime.
+# Models must be pre-downloaded via setup.sh / download-model.sh.
+os.environ['HF_HUB_OFFLINE'] = '1'
+os.environ['TRANSFORMERS_OFFLINE'] = '1'
 
 from pymilvus import MilvusClient, DataType, CollectionSchema, FieldSchema
 from mlx_embeddings.utils import load as mlx_load, generate as mlx_generate
@@ -38,6 +37,7 @@ logger = logging.getLogger("session-rag.milvus")
 
 _EMBED_DIM = 768
 _MODEL_ID = "nomic-ai/modernbert-embed-base"
+_MODEL_CACHE = Path.home() / ".cache/huggingface/hub/models--nomic-ai--modernbert-embed-base"
 COLLECTION_NAME = "sessions"
 
 # ModernBERT Embed uses the same Nomic task prefixes
@@ -53,6 +53,12 @@ def get_model():
     global _mlx_model, _mlx_tokenizer
     if _mlx_model is not None:
         return _mlx_model, _mlx_tokenizer
+
+    if not _MODEL_CACHE.exists():
+        raise RuntimeError(
+            f"Embedding model not cached at {_MODEL_CACHE}. "
+            f"Run ./setup.sh or ./download-model.sh to download it."
+        )
 
     print(f"Loading {_MODEL_ID} via mlx-embeddings...", file=sys.stderr)
     _mlx_model, _mlx_tokenizer = mlx_load(_MODEL_ID)
@@ -626,6 +632,59 @@ def delete_older_than(max_age_days: int, db_path: Optional[str] = None) -> int:
         logger.warning("FTS delete older_than failed (non-fatal): %s", e)
 
     return len(results)
+
+
+def backfill_fts(db_path: Optional[str] = None) -> int:
+    """Populate FTS from Milvus for any records missing from the FTS index.
+
+    Queries all doc_ids from Milvus, checks which are absent from FTS,
+    and inserts the missing ones. Returns count of backfilled records.
+    """
+    if not db_path:
+        return 0
+
+    all_rows = _query_all(
+        ["doc_id", "document", "session_id", "git_branch", "turn_index",
+         "timestamp", "chunk_type", "project_root"],
+        db_path=db_path,
+    )
+    if not all_rows:
+        return 0
+
+    fts_conn = _fts.connection(db_path)
+
+    # Find which doc_ids are already in FTS
+    existing = set()
+    for row in all_rows:
+        doc_id = row.get("doc_id", "")
+        if doc_id:
+            hit = fts_conn.execute(
+                f"SELECT doc_id FROM {_fts.table_name} WHERE doc_id = ?", (doc_id,)
+            ).fetchone()
+            if hit:
+                existing.add(doc_id)
+
+    missing = [r for r in all_rows if r.get("doc_id", "") not in existing]
+    if not missing:
+        _fts.close_ephemeral(fts_conn)
+        return 0
+
+    records = [{
+        "doc_id": r["doc_id"],
+        "content": r.get("document", ""),
+        "session_id": r.get("session_id", ""),
+        "git_branch": r.get("git_branch", ""),
+        "turn_index": r.get("turn_index", 0),
+        "timestamp": r.get("timestamp", ""),
+        "chunk_type": r.get("chunk_type", "turn"),
+        "project_root": r.get("project_root", ""),
+    } for r in missing]
+
+    _fts.insert(fts_conn, records)
+    _fts.close_ephemeral(fts_conn)
+
+    logger.info("FTS backfill: inserted %d records", len(records))
+    return len(records)
 
 
 def clear_collection(db_path: Optional[str] = None):

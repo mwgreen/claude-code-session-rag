@@ -10,6 +10,7 @@ Start: ./session-rag-server.sh
 Health: curl http://127.0.0.1:7102/health
 """
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -32,6 +33,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 import rag_engine
 import transcript_parser
 import file_watcher
+from file_watcher import register_project, get_global_watcher
 from tools import register_tools, set_current_project_root
 
 logger = logging.getLogger("session-rag")
@@ -141,11 +143,11 @@ async def index_endpoint(request: Request) -> JSONResponse:
 
     db_path = str(Path.home() / ".session-rag" / "milvus.db")
 
-    # Ensure file watcher is running for this project
-    await file_watcher.ensure_watcher(project_root, db_path)
+    # Register slug→root mapping for the global watcher
+    register_project(project_root)
 
-    # Load incremental state
-    state = transcript_parser.load_index_state(project_root)
+    # Load centralized incremental state
+    state = transcript_parser.load_index_state()
     offset = transcript_parser.get_transcript_offset(state, transcript_path)
 
     # Parse new turns
@@ -155,8 +157,9 @@ async def index_endpoint(request: Request) -> JSONResponse:
 
     if not turns:
         # Update offset even if no turns (e.g., only tool_result messages)
-        transcript_parser.set_transcript_offset(state, transcript_path, new_offset)
-        transcript_parser.save_index_state(project_root, state)
+        transcript_parser.set_transcript_offset(
+            state, transcript_path, new_offset, project_root=project_root)
+        transcript_parser.save_index_state(state)
         return JSONResponse({"indexed": 0, "message": "No new turns to index"})
 
     # Inject project_root into each turn
@@ -167,8 +170,9 @@ async def index_endpoint(request: Request) -> JSONResponse:
     count = await rag_engine.add_turns_async(turns, db_path=db_path)
 
     # Save state
-    transcript_parser.set_transcript_offset(state, transcript_path, new_offset)
-    transcript_parser.save_index_state(project_root, state)
+    transcript_parser.set_transcript_offset(
+        state, transcript_path, new_offset, project_root=project_root)
+    transcript_parser.save_index_state(state)
 
     print(f"[index] Indexed {count} turns from {os.path.basename(transcript_path)} "
           f"(session {session_id[:8]})", file=sys.stderr)
@@ -181,7 +185,7 @@ async def index_endpoint(request: Request) -> JSONResponse:
         if now - last_expire > _EXPIRE_CHECK_INTERVAL:
             expired = rag_engine.delete_older_than(AUTO_EXPIRE_DAYS, db_path=db_path)
             state["last_expire_check"] = now
-            transcript_parser.save_index_state(project_root, state)
+            transcript_parser.save_index_state(state)
             if expired > 0:
                 print(f"[expire] Pruned {expired} turns older than {AUTO_EXPIRE_DAYS} days",
                       file=sys.stderr)
@@ -216,26 +220,28 @@ async def watch_endpoint(request: Request) -> JSONResponse:
             status_code=400,
         )
 
-    db_path = str(Path.home() / ".session-rag" / "milvus.db")
+    # Register slug→root mapping
+    register_project(project_root)
 
-    # Ensure watcher is running
-    watcher = await file_watcher.ensure_watcher(project_root, db_path)
-
-    # Trigger backfill in the background
+    # Trigger backfill for this project's slug dir
     backfilled = 0
+    watcher = get_global_watcher()
     if watcher is not None:
-        backfilled = await watcher.backfill()
+        from file_watcher import _project_root_to_slug
+        slug = _project_root_to_slug(project_root)
+        backfilled = await watcher.backfill(slug_filter=slug)
 
     # Auto-expiry check
     expired = 0
     if AUTO_EXPIRE_DAYS > 0:
-        state = transcript_parser.load_index_state(project_root)
+        db_path = str(Path.home() / ".session-rag" / "milvus.db")
+        state = transcript_parser.load_index_state()
         last_expire = state.get("last_expire_check", 0)
         now = time.time()
         if now - last_expire > _EXPIRE_CHECK_INTERVAL:
             expired = rag_engine.delete_older_than(AUTO_EXPIRE_DAYS, db_path=db_path)
             state["last_expire_check"] = now
-            transcript_parser.save_index_state(project_root, state)
+            transcript_parser.save_index_state(state)
             if expired > 0:
                 print(f"[expire] Pruned {expired} turns older than {AUTO_EXPIRE_DAYS} days",
                       file=sys.stderr)
@@ -274,6 +280,24 @@ async def lifespan(app: Starlette):
     except Exception as e:
         print(f"[HTTP] Warning: Could not init server mode: {e}", file=sys.stderr)
 
+    # Backfill FTS from Milvus for any records indexed before FTS was added
+    db_path = str(_SERVER_DIR / "milvus.db")
+    try:
+        backfilled = rag_engine.backfill_fts(db_path=db_path)
+        if backfilled:
+            print(f"[HTTP] FTS backfill: {backfilled} records", file=sys.stderr)
+    except Exception as e:
+        print(f"[HTTP] Warning: FTS backfill failed: {e}", file=sys.stderr)
+
+    # Start global file watcher on ~/.claude/projects/
+    try:
+        watcher = await file_watcher.start_global_watcher(db_path)
+        if watcher:
+            # Full backfill across all projects in background
+            asyncio.create_task(watcher.backfill())
+    except Exception as e:
+        print(f"[HTTP] Warning: Global watcher start failed: {e}", file=sys.stderr)
+
     async with session_manager.run():
         print(f"[HTTP] Server ready on http://{HOST}:{PORT}", file=sys.stderr)
         try:
@@ -281,7 +305,7 @@ async def lifespan(app: Starlette):
         finally:
             pass
 
-    await file_watcher.stop_all_watchers()
+    await file_watcher.stop_global_watcher()
     rag_engine.close_server_mode()
     if PID_FILE.exists():
         PID_FILE.unlink()
