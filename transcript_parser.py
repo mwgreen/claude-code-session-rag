@@ -268,7 +268,7 @@ def _migrate_per_project_states(state: Dict):
     # Scan for any .session-rag/index_state.json under common project roots
     home = Path.home()
     candidates = []
-    for idea_dir in [home / "IdeaProjects"]:
+    for idea_dir in [home / "IdeaProjects", home / "git-repos"]:
         if idea_dir.is_dir():
             for project_dir in idea_dir.iterdir():
                 state_file = project_dir / ".session-rag" / "index_state.json"

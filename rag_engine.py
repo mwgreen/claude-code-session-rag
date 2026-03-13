@@ -9,7 +9,7 @@ Results merged with Reciprocal Rank Fusion (RRF).
 
 Each turn is tagged with a project_root field, enabling per-project or cross-project search.
 
-Supports multiple embedding models via SESSION_RAG_MODEL env var (default: modernbert).
+Supports multiple embedding models via SESSION_RAG_MODEL env var (default: embeddinggemma).
 """
 
 import hashlib
