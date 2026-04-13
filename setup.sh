@@ -213,22 +213,51 @@ with open(settings_file, "w") as f:
 print("  Settings saved")
 PYEOF
 
-# --- Generate MCP config template ---
+# --- Install global MCP server (user scope) ---
 echo ""
-cat > mcp-config-template.json << MCPEOF
-{
-  "mcpServers": {
-    "session-rag": {
-      "type": "http",
-      "url": "http://127.0.0.1:7102/mcp/",
-      "headers": {
-        "X-Project-Root": "/path/to/your/project"
-      }
-    }
-  }
+echo "Installing global MCP server..."
+
+# Create headersHelper script
+MCP_HELPERS_DIR="$HOME/.claude/mcp-helpers"
+mkdir -p "$MCP_HELPERS_DIR"
+cat > "$MCP_HELPERS_DIR/session-rag-headers.sh" << 'HELPEREOF'
+#!/bin/bash
+# Dynamic header helper for session-rag MCP server.
+# Outputs JSON with X-Project-Root set to the git repo root (or cwd).
+PROJECT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+echo "{\"X-Project-Root\": \"$PROJECT_ROOT\"}"
+HELPEREOF
+chmod +x "$MCP_HELPERS_DIR/session-rag-headers.sh"
+echo "  Header helper installed: $MCP_HELPERS_DIR/session-rag-headers.sh"
+
+# Add MCP server to ~/.claude.json (user scope)
+CLAUDE_JSON="$HOME/.claude.json"
+python3 << PYEOF
+import json
+import os
+
+claude_json = "$CLAUDE_JSON"
+helpers_dir = "$MCP_HELPERS_DIR"
+
+if os.path.exists(claude_json):
+    with open(claude_json) as f:
+        data = json.load(f)
+else:
+    data = {}
+
+servers = data.setdefault("mcpServers", {})
+servers["session-rag"] = {
+    "type": "http",
+    "url": "http://127.0.0.1:7102/mcp/",
+    "headersHelper": f"{helpers_dir}/session-rag-headers.sh",
 }
-MCPEOF
-echo "  mcp-config-template.json created"
+
+with open(claude_json, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+
+print("  MCP server added to ~/.claude.json (user scope, all projects)")
+PYEOF
 
 # --- Done ---
 echo ""
@@ -243,17 +272,11 @@ echo "  - SessionStart: auto-start server + register file watcher + backfill"
 echo "  - Stop: index final turns when session ends"
 echo "  - PreCompact: index turns before context compaction"
 echo ""
-echo "Next steps:"
+echo "MCP server installed globally in: ~/.claude.json"
+echo "  - Available in all projects automatically"
+echo "  - Dynamic project root via headersHelper"
 echo ""
-echo "1. Add MCP server to each project's .mcp.json:"
-echo '   "session-rag": {'
-echo '     "type": "http",'
-echo '     "url": "http://127.0.0.1:7102/mcp/",'
-echo '     "headers": { "X-Project-Root": "/path/to/your/project" }'
-echo '   }'
-echo "   (see mcp-config-template.json)"
-echo ""
-echo "2. Restart Claude Code to activate hooks"
+echo "Next step: Restart Claude Code to activate"
 echo ""
 echo "See README.md for full documentation."
 echo "======================================================================"
