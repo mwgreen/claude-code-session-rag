@@ -379,6 +379,7 @@ def add_turns(turns: List[Dict], db_path: Optional[str] = None) -> int:
 def search(query: str, n: int = 5, session_id: Optional[str] = None,
            git_branch: Optional[str] = None, project_root: Optional[str] = None,
            recency_boost: bool = False,
+           date_from: Optional[str] = None, date_to: Optional[str] = None,
            db_path: Optional[str] = None) -> List[Dict]:
     """Hybrid search: vector similarity + FTS5 keyword search, merged with RRF.
 
@@ -387,6 +388,8 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
 
     project_root: when set, restricts results to that project. When None,
     searches across all projects (cross-project search).
+    date_from/date_to: ISO 8601 date strings (e.g. '2026-04-02') to restrict
+    results to a time range. Timestamps are VARCHAR and sort lexicographically.
     """
     # Expanded candidate pool for both engines
     fetch_n = n * 3
@@ -401,6 +404,10 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
         filters.append(f'git_branch == "{git_branch}"')
     if project_root:
         filters.append(f'project_root == "{project_root}"')
+    if date_from:
+        filters.append(f'timestamp >= "{date_from}"')
+    if date_to:
+        filters.append(f'timestamp <= "{date_to}T23:59:59"')
     filter_expr = " && ".join(filters) if filters else None
 
     with milvus_client(db_path) as client:
@@ -439,6 +446,10 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
         fts_filters["git_branch"] = git_branch
     if project_root:
         fts_filters["project_root"] = project_root
+    if date_from:
+        fts_filters["timestamp_gte"] = (">=", date_from)
+    if date_to:
+        fts_filters["timestamp_lte"] = ("<=", f"{date_to}T23:59:59")
     fts_results = _fts.search(query, n=fetch_n, filters=fts_filters or None, db_path=db_path)
 
     # --- Merge with RRF ---
