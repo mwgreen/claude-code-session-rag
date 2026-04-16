@@ -161,7 +161,7 @@ def register_tools(server: Server):
                 name="search_all_sessions",
                 description=(
                     "Search across ALL past conversation sessions. Pure semantic search "
-                    "without recency bias. Optionally filter by git branch."
+                    "without recency bias. Optionally filter by git branch or date range."
                 ),
                 inputSchema={
                     "type": "object",
@@ -182,6 +182,14 @@ def register_tools(server: Server):
                         "project_root": {
                             "type": "string",
                             "description": "Filter to a specific project path, or '*' for all projects. Default: current project.",
+                        },
+                        "date_from": {
+                            "type": "string",
+                            "description": "ISO date lower bound, inclusive (e.g., '2026-04-02'). Only returns turns on or after this date.",
+                        },
+                        "date_to": {
+                            "type": "string",
+                            "description": "ISO date upper bound, inclusive (e.g., '2026-04-02'). Only returns turns on or before this date.",
                         },
                     },
                     "required": ["query"],
@@ -288,6 +296,8 @@ def register_tools(server: Server):
                     git_branch=arguments.get("git_branch"),
                     project_root=pr,
                     recency_boost=False,
+                    date_from=arguments.get("date_from"),
+                    date_to=arguments.get("date_to"),
                     db_path=db,
                 )
                 return [types.TextContent(type="text", text=format_results(results))]

@@ -215,9 +215,16 @@ class FTSIndex:
         where_parts = []
         params: list = []
         if filters:
-            for col, val in filters.items():
-                if val is not None:
-                    where_parts.append(f"{col} = ?")
+            for key, val in filters.items():
+                if val is None:
+                    continue
+                if isinstance(val, tuple) and len(val) == 2:
+                    op, operand = val
+                    col = key.rsplit("_", 1)[0] if key.endswith(("_gte", "_lte", "_gt", "_lt")) else key
+                    where_parts.append(f"{col} {op} ?")
+                    params.append(operand)
+                else:
+                    where_parts.append(f"{key} = ?")
                     params.append(val)
 
         where_clause = (" AND " + " AND ".join(where_parts)) if where_parts else ""
