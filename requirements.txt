@@ -3,7 +3,7 @@ setuptools>=70.0,<82.0
 mlx>=0.30.0
 mlx-embeddings
 transformers<5.0
-mcp>=1.0.0
+mcp>=1.0.0,<2.0  # 2.x removed Server.list_tools() decorator used in tools.py
 starlette
 uvicorn
 httpx
