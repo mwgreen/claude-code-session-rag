@@ -106,6 +106,8 @@ event loop responsive and avoids cross-thread SQLite use.
 | `SESSION_RAG_WATCH` | `true` | Enable the file watcher |
 | `SESSION_RAG_WATCH_DEBOUNCE` | `2.0` | Seconds of quiet before a changed transcript is indexed |
 | `SESSION_RAG_LOG_LEVEL` | `INFO` | Server log level |
+| `SESSION_RAG_START_CONFIRM` | `15` | Seconds `start` waits for `/health` before handing readiness to the watchdog |
+| `SESSION_RAG_STARTUP_GRACE` | `180` | Seconds the watchdog leaves a live but not yet healthy server alone |
 | `SESSION_RAG_CA_BUNDLE` | | Extra CA certificate (PEM) for model downloads behind a TLS proxy. `NODE_EXTRA_CA_CERTS` is honoured too. |
 
 The model choice is normally stored in `~/.session-rag/config.json` (written by
@@ -181,6 +183,11 @@ Stop the server first; Milvus Lite allows one process per database.
 curl http://127.0.0.1:7102/health # 200 when ready, 503 while starting
 curl http://127.0.0.1:7102/status
 ```
+
+`start` returns within `SESSION_RAG_START_CONFIRM` seconds even on a cold boot; if the
+model is still loading, the watchdog takes over and reports readiness in the log. The
+watchdog restarts a server whose `/health` stays down, but never one that is still
+starting, and backs off on repeated restarts.
 
 With the launchd agent installed, `start`/`stop`/`restart` go through `launchctl`, so the
 hooks, the watchdog and launchd can never start competing server processes (which is
