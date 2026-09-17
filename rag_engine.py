@@ -1,257 +1,257 @@
 """
 RAG engine for session transcripts.
 
-Embeds conversation turns via mlx-embeddings. Stores vectors in a single global
-Milvus Lite DB at ~/.session-rag/.
+Storage: one global Milvus Lite collection at ~/.session-rag/milvus.db (vectors +
+metadata) mirrored by a SQLite FTS5 table (keyword search, and the source text
+for re-embedding). Search is hybrid: cosine vector search + BM25, merged with
+Reciprocal Rank Fusion, with an optional recency boost.
 
-Full-text search via SQLite FTS5 sidecar for hybrid search (vector + keyword).
-Results merged with Reciprocal Rank Fusion (RRF).
+Concurrency: in server mode every engine call runs on ONE worker thread
+(`run()`), which keeps Milvus/SQLite/MLX usage single-threaded and keeps the
+asyncio event loop free while embeddings are computed.
 
-Each turn is tagged with a project_root field, enabling per-project or cross-project search.
-
-Supports multiple embedding models via SESSION_RAG_MODEL env var (default: embeddinggemma).
+Milvus note: for the COSINE metric Milvus reports *similarity* in the `distance`
+field (1.0 = identical). We surface it as `similarity`.
 """
 
-import hashlib
-import json
-import os
-from pathlib import Path
+from __future__ import annotations
 
-# Block all HuggingFace network access at runtime.
-# Models must be pre-downloaded via setup.sh / download-model.sh.
-os.environ['HF_HUB_OFFLINE'] = '1'
-os.environ['TRANSFORMERS_OFFLINE'] = '1'
-
-from pymilvus import MilvusClient, DataType, CollectionSchema, FieldSchema
-from mlx_embeddings.utils import load as mlx_load, generate as mlx_generate
-import mlx.core as mx
-from contextlib import contextmanager
-from typing import List, Dict, Optional
 import asyncio
+import functools
+import hashlib
 import logging
-import sys
+import os
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
-from fts_hybrid import FTSIndex, rrf_merge
+# Quiet the gRPC keepalive chatter that milvus-lite writes to stderr.
+os.environ.setdefault("GRPC_VERBOSITY", "NONE")
+os.environ.setdefault("GLOG_minloglevel", "2")
 
-logger = logging.getLogger("session-rag.milvus")
+from pymilvus import CollectionSchema, DataType, FieldSchema, MilvusClient  # noqa: E402
 
-# --- Model registry ---
+from embedder import Embedder, ModelSpec, get_spec  # noqa: E402
+from fts_hybrid import FTSIndex, rrf_merge  # noqa: E402
+from index_state import STATE_DIR, atomic_write_json, read_json  # noqa: E402
 
-_MODEL_REGISTRY = {
-    "modernbert": {
-        "model_id": "nomic-ai/modernbert-embed-base",
-        "embed_dim": 768,
-        "max_tokens": 8192,
-        "search_prefix": "search_query: ",
-        "document_prefix": "search_document: ",
-        "cache_subdir": "models--nomic-ai--modernbert-embed-base",
-    },
-    "embeddinggemma": {
-        "model_id": "mlx-community/embeddinggemma-300m-bf16",
-        "embed_dim": 768,
-        "max_tokens": 2048,
-        "search_prefix": "task: search result | query: ",
-        "document_prefix": "title: none | text: ",
-        "cache_subdir": "models--mlx-community--embeddinggemma-300m-bf16",
-    },
-}
-
-_MODEL_NAME = os.getenv("SESSION_RAG_MODEL", "embeddinggemma").lower()
-if _MODEL_NAME not in _MODEL_REGISTRY:
-    raise ValueError(
-        f"Unknown model '{_MODEL_NAME}'. "
-        f"Valid options: {', '.join(_MODEL_REGISTRY.keys())}"
-    )
-
-_MODEL_CFG = _MODEL_REGISTRY[_MODEL_NAME]
-_EMBED_DIM = _MODEL_CFG["embed_dim"]
-_MODEL_ID = _MODEL_CFG["model_id"]
-_MODEL_CACHE = Path.home() / ".cache/huggingface/hub" / _MODEL_CFG["cache_subdir"]
-_SEARCH_PREFIX = _MODEL_CFG["search_prefix"]
-_DOCUMENT_PREFIX = _MODEL_CFG["document_prefix"]
+logger = logging.getLogger("session-rag.engine")
 
 COLLECTION_NAME = "sessions"
+DEFAULT_DB_PATH = str(STATE_DIR / "milvus.db")
+IDENTITY_FILE = STATE_DIR / "model_identity.json"
+MILVUS_PAGE_MAX = 16384          # Milvus caps offset+limit per query
+_ID_BITS = 60                    # primary key = first 15 hex digits of sha256(doc_id)
+_SCAN_BUCKETS = 64
+RRF_K = 60
+RECENCY_WEIGHT = 0.3
+MAX_RESULTS = 50
 
-# --- Model identity check ---
+METADATA_FIELDS = ["session_id", "transcript_file", "turn_index", "timestamp",
+                   "git_branch", "chunk_type", "project_root"]
+OUTPUT_FIELDS = ["document", "doc_id"] + METADATA_FIELDS
+FTS_METADATA = ["session_id", "git_branch", "turn_index", "timestamp", "chunk_type",
+                "project_root", "transcript_file"]
 
-_IDENTITY_FILE = Path.home() / ".session-rag" / "model_identity.json"
+# Chunks produced by older parser versions that indexed Claude Code's own markup.
+NOISE_PREFIXES = ("User: <command-name>", "User: <local-command", "User: <system-reminder>",
+                  "User: <task-notification>", "User: <bash-input>", "User: <<")
+
+# --- Module state -------------------------------------------------------------
+
+_spec: ModelSpec = get_spec()
+_embedder = Embedder(_spec)
+_fts = FTSIndex("turns_fts", FTS_METADATA)
+_clients: Dict[str, MilvusClient] = {}
+_server_mode = False
+_executor: Optional[ThreadPoolExecutor] = None
 
 
-def _check_model_identity(db_path: Optional[str] = None):
-    """Verify that the active model matches what was used to build the index.
-
-    On first run, stamps model_identity.json. On subsequent runs, if the stored
-    model differs and the index has data, raises an error to prevent mixing
-    incompatible vectors.
-    """
-    _IDENTITY_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    if _IDENTITY_FILE.exists():
-        stored = json.loads(_IDENTITY_FILE.read_text())
-        stored_model = stored.get("model_name", "")
-        if stored_model and stored_model != _MODEL_NAME:
-            # Check if the index actually has data before raising
-            has_data = False
-            if db_path:
-                try:
-                    client = MilvusClient(db_path)
-                    if client.has_collection(COLLECTION_NAME):
-                        count = client.query(
-                            collection_name=COLLECTION_NAME,
-                            filter="",
-                            limit=1,
-                            output_fields=["id"],
-                        )
-                        has_data = len(count) > 0
-                    client.close()
-                except Exception:
-                    pass
-            if has_data:
-                raise RuntimeError(
-                    f"Model mismatch: index was built with '{stored_model}' but "
-                    f"SESSION_RAG_MODEL is '{_MODEL_NAME}'. "
-                    f"Run cleanup.py reset or clear the index before switching models."
-                )
-            # Index is empty — safe to overwrite the stamp
-    # Stamp current model
-    _IDENTITY_FILE.write_text(json.dumps({"model_name": _MODEL_NAME}))
+def use_model(name: Optional[str]) -> ModelSpec:
+    """Switch the active embedding model (CLI use, before anything is loaded)."""
+    global _spec, _embedder
+    _spec = get_spec(name)
+    _embedder = Embedder(_spec)
+    return _spec
 
 
 def get_model_name() -> str:
-    """Return the active model's short name (e.g. 'modernbert', 'embeddinggemma')."""
-    return _MODEL_NAME
-
-_mlx_model = None
-_mlx_tokenizer = None
+    return _spec.name
 
 
-def get_model():
-    """Get or load the MLX embedding model (one-time load)."""
-    global _mlx_model, _mlx_tokenizer
-    if _mlx_model is not None:
-        return _mlx_model, _mlx_tokenizer
-
-    if not _MODEL_CACHE.exists():
-        raise RuntimeError(
-            f"Embedding model not cached at {_MODEL_CACHE}. "
-            f"Run ./setup.sh or ./download-model.sh to download it."
-        )
-
-    print(f"Loading {_MODEL_ID} via mlx-embeddings...", file=sys.stderr)
-    _mlx_model, _mlx_tokenizer = mlx_load(_MODEL_ID)
-    print(f"{_MODEL_ID} ready ({_EMBED_DIM} dims, {_MODEL_CFG['max_tokens']} token context)", file=sys.stderr)
-    return _mlx_model, _mlx_tokenizer
+def model_spec() -> ModelSpec:
+    return _spec
 
 
-def _needs_input_remap() -> bool:
-    """Check if the model's __call__ uses 'inputs' instead of 'input_ids'.
+def load_model() -> None:
+    _embedder.load()
 
-    Works around mlx-embeddings gemma3_text models where __call__ expects
-    'inputs' but the tokenizer returns 'input_ids'.
-    """
-    return "gemma" in _MODEL_NAME
+
+def model_loaded() -> bool:
+    return _embedder.loaded
 
 
 def embed_texts(texts: List[str], is_query: bool = False) -> List[List[float]]:
-    """Embed texts using the configured model. Adds model-specific prefix."""
-    model, tokenizer = get_model()
-    prefix = _SEARCH_PREFIX if is_query else _DOCUMENT_PREFIX
-    prefixed = [prefix + t for t in texts]
-
-    if _needs_input_remap():
-        # gemma3_text models expect (inputs, attention_mask) not (input_ids, ...)
-        encoded = tokenizer.batch_encode_plus(
-            prefixed, return_tensors="mlx", padding=True,
-            truncation=True, max_length=_MODEL_CFG["max_tokens"],
-        )
-        output = model(encoded["input_ids"], attention_mask=encoded.get("attention_mask"))
-    else:
-        output = mlx_generate(model, tokenizer, texts=prefixed,
-                              max_length=_MODEL_CFG["max_tokens"])
-
-    embeddings = output.text_embeds.tolist()
-    mx.clear_cache()
-    return embeddings
+    if is_query:
+        return [_embedder.embed_query(t) for t in texts]
+    return _embedder.embed_documents(texts)
 
 
-# --- Milvus client management ---
+# --- Server mode / worker thread ----------------------------------------------
 
-_persistent_clients: Dict[str, MilvusClient] = {}
-_fts = FTSIndex("turns_fts", ["session_id", "git_branch", "turn_index", "timestamp", "chunk_type", "project_root"])
-_write_lock: Optional[asyncio.Lock] = None
-_embed_semaphore: Optional[asyncio.Semaphore] = None
-_server_mode = False
-
-
-def init_server_mode(db_path: Optional[str] = None):
-    """Initialize async concurrency primitives for HTTP server mode."""
-    global _write_lock, _embed_semaphore, _server_mode
-    _check_model_identity(db_path=db_path)
-    _write_lock = asyncio.Lock()
-    _embed_semaphore = asyncio.Semaphore(1)
+def init_server_mode(db_path: Optional[str] = None) -> None:
+    """Enable persistent connections and the single engine worker thread."""
+    global _server_mode, _executor
+    db_path = _resolve_db_path(db_path)
+    _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rag-engine")
     _server_mode = True
     _fts.set_server_mode(True)
-    print(f"Server mode initialized (model: {_MODEL_NAME})", file=sys.stderr)
+    _check_model_identity(db_path)
+    logger.info("Server mode initialised (model=%s, dim=%d)", _spec.name, _spec.dim)
 
 
-def close_server_mode():
-    """Close all persistent clients (Milvus + FTS) and reset server mode."""
-    global _write_lock, _embed_semaphore, _server_mode
-    for path, client in list(_persistent_clients.items()):
-        try:
-            client.close()
-            logger.info("Closed Milvus client: %s", path)
-        except Exception as e:
-            logger.warning("Error closing Milvus client %s: %s", path, e)
-    _persistent_clients.clear()
-    _fts.close_all()
-    _write_lock = None
-    _embed_semaphore = None
-    _server_mode = False
+def close_server_mode() -> None:
+    global _server_mode, _executor
 
-
-def _get_persistent_client(db_path: str) -> MilvusClient:
-    """Get or create a persistent client for the given DB path.
-    On failure, evicts the stale client and retries once."""
-    if db_path in _persistent_clients:
-        try:
-            _persistent_clients[db_path].has_collection(COLLECTION_NAME)
-            return _persistent_clients[db_path]
-        except Exception as e:
-            logger.warning("Stale Milvus client for %s: %s — reconnecting", db_path, e)
+    def _close():
+        for path, client in list(_clients.items()):
             try:
-                _persistent_clients[db_path].close()
-            except Exception:
-                pass
-            del _persistent_clients[db_path]
+                client.close()
+            except Exception as exc:
+                logger.warning("Error closing Milvus client %s: %s", path, exc)
+        _clients.clear()
+        _fts.close_all()
 
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    if _executor is not None:
+        try:
+            _executor.submit(_close).result(timeout=30)
+        except Exception as exc:
+            logger.warning("Error during engine shutdown: %s", exc)
+        _executor.shutdown(wait=False)
+    else:
+        _close()
+    _executor = None
+    _server_mode = False
+    _fts.set_server_mode(False)
+
+
+async def run(fn: Callable, *args, **kwargs):
+    """Run a blocking engine function on the engine worker thread."""
+    loop = asyncio.get_running_loop()
+    call = functools.partial(fn, *args, **kwargs)
+    if _executor is None:
+        return await loop.run_in_executor(None, call)
+    return await loop.run_in_executor(_executor, call)
+
+
+# Backwards-compatible async wrappers
+async def search_async(*args, **kwargs):
+    return await run(search, *args, **kwargs)
+
+
+async def add_turns_async(turns: List[Dict], db_path: Optional[str] = None) -> int:
+    return await run(add_turns, turns, db_path=db_path)
+
+
+# --- Model identity -----------------------------------------------------------
+
+def read_identity() -> Dict:
+    data = read_json(IDENTITY_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def stamp_identity() -> None:
+    atomic_write_json(IDENTITY_FILE, _embedder.identity(), indent=None)
+
+
+def _collection_dim(client: MilvusClient) -> Optional[int]:
     try:
-        _persistent_clients[db_path] = MilvusClient(db_path)
-        logger.info("Opened client: %s", db_path)
-    except Exception as e:
-        logger.error("Failed to connect to Milvus at %s: %s", db_path, e)
-        raise
-    return _persistent_clients[db_path]
+        info = client.describe_collection(COLLECTION_NAME)
+        for field in info.get("fields", []):
+            if field.get("name") == "vector":
+                return int(field.get("params", {}).get("dim"))
+    except Exception as exc:
+        logger.debug("describe_collection failed: %s", exc)
+    return None
 
+
+def _check_model_identity(db_path: str) -> None:
+    """Refuse to mix vectors from different models. Stamps the identity on first use."""
+    stored = read_identity()
+    stored_name = stored.get("model_name")
+    stored_id = stored.get("model_id")
+    if stored_name and (stored_name != _spec.name or (stored_id and stored_id != _spec.model_id)):
+        if count(db_path=db_path) > 0:
+            raise RuntimeError(
+                f"Model mismatch: the index was built with '{stored_name}' ({stored_id or 'unknown id'}) "
+                f"but SESSION_RAG_MODEL is '{_spec.name}' ({_spec.model_id}). Stop the server and run "
+                f"'python cleanup.py migrate-model --to {_spec.name}' to re-embed the existing index, "
+                f"or 'python cleanup.py reset' to start empty."
+            )
+    with milvus_client(db_path) as client:
+        if client.has_collection(COLLECTION_NAME):
+            dim = _collection_dim(client)
+            if dim and dim != _spec.dim:
+                raise RuntimeError(
+                    f"Collection vector dimension is {dim} but model '{_spec.name}' produces {_spec.dim}. "
+                    f"Run 'python cleanup.py migrate-model --to {_spec.name}'."
+                )
+    stamp_identity()
+
+
+# --- Milvus client management ---------------------------------------------------
 
 def _resolve_db_path(db_path: Optional[str]) -> str:
-    if not db_path:
-        raise ValueError("db_path is required. Global index is at ~/.session-rag/milvus.db")
-    return db_path
+    return db_path or DEFAULT_DB_PATH
 
 
-def _ensure_collection(client: MilvusClient):
-    """Create the sessions collection with explicit schema if it doesn't exist."""
+def _open_client(db_path: str, attempts: int = 8, delay: float = 1.0) -> MilvusClient:
+    """Open Milvus Lite. Retries briefly: right after a restart the previous
+    process may still hold the database lock for a second or two."""
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return MilvusClient(db_path)
+        except Exception as exc:  # pymilvus raises ConnectionConfigException("Open local milvus failed")
+            last_exc = exc
+            if attempt < attempts:
+                logger.warning("Milvus database busy (%s); retry %d/%d in %.0fs", exc, attempt, attempts, delay)
+                time.sleep(delay)
+    raise RuntimeError(
+        f"Could not open {db_path}: {last_exc}. Another session-rag process (or cleanup.py) "
+        f"is probably using it. Check: ./session-rag-server.sh status"
+    ) from last_exc
+
+
+def _persistent_client(db_path: str) -> MilvusClient:
+    client = _clients.get(db_path)
+    if client is not None:
+        try:
+            client.has_collection(COLLECTION_NAME)
+            return client
+        except Exception as exc:
+            logger.warning("Milvus client unusable (%s); reconnecting", exc)
+            try:
+                client.close()
+            except Exception:
+                pass
+            _clients.pop(db_path, None)
+    client = _open_client(db_path)
+    _clients[db_path] = client
+    return client
+
+
+def _ensure_collection(client: MilvusClient) -> None:
     if client.has_collection(COLLECTION_NAME):
         return
-
-    print(f"Creating collection: {COLLECTION_NAME} (dim={_EMBED_DIM})", file=sys.stderr)
-
+    logger.info("Creating collection %s (dim=%d)", COLLECTION_NAME, _spec.dim)
     schema = CollectionSchema(fields=[
         FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=False),
-        FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=_EMBED_DIM),
+        FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=_spec.dim),
         FieldSchema(name="document", dtype=DataType.VARCHAR, max_length=65535),
         FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length=512),
         FieldSchema(name="session_id", dtype=DataType.VARCHAR, max_length=128),
@@ -262,611 +262,483 @@ def _ensure_collection(client: MilvusClient):
         FieldSchema(name="chunk_type", dtype=DataType.VARCHAR, max_length=64),
         FieldSchema(name="project_root", dtype=DataType.VARCHAR, max_length=512),
     ])
-
     index_params = client.prepare_index_params()
     index_params.add_index(field_name="vector", index_type="FLAT", metric_type="COSINE")
-
-    client.create_collection(
-        collection_name=COLLECTION_NAME,
-        schema=schema,
-        index_params=index_params,
-    )
-
-    print(f"Collection created: {COLLECTION_NAME}", file=sys.stderr)
+    client.create_collection(collection_name=COLLECTION_NAME, schema=schema, index_params=index_params)
 
 
 @contextmanager
-def milvus_client(db_path: Optional[str] = None):
-    """Get a Milvus client. In server mode, reuses persistent client."""
+def milvus_client(db_path: Optional[str] = None, ensure: bool = True):
+    """Yield a Milvus client (persistent in server mode, ephemeral otherwise)."""
     path = _resolve_db_path(db_path)
-
     if _server_mode:
-        client = _get_persistent_client(path)
-        _ensure_collection(client)
+        client = _persistent_client(path)
+        if ensure:
+            _ensure_collection(client)
         yield client
     else:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        client = MilvusClient(path)
-        _ensure_collection(client)
+        client = _open_client(path)
         try:
+            if ensure:
+                _ensure_collection(client)
             yield client
         finally:
             client.close()
 
 
-# --- Core operations ---
+# --- Filter helpers -----------------------------------------------------------
+
+def _literal(value: str) -> str:
+    """Quote a string for a Milvus filter expression."""
+    value = str(value)
+    if '"' not in value:
+        return f'"{value}"'
+    if "'" not in value:
+        return f"'{value}'"
+    raise ValueError("filter value may not contain both single and double quotes")
+
+
+def _project_filter(project_root: str, prefix: bool) -> str:
+    exact = f"project_root == {_literal(project_root)}"
+    if not prefix:
+        return exact
+    like = _literal(project_root.rstrip("/") + "/%")
+    return f"({exact} or project_root like {like})"
+
+
+def _build_filter(session_id: Optional[str] = None, git_branch: Optional[str] = None,
+                  project_root: Optional[str] = None, project_prefix: bool = True) -> Optional[str]:
+    parts = []
+    if session_id:
+        parts.append(f"session_id == {_literal(session_id)}")
+    if git_branch:
+        parts.append(f"git_branch == {_literal(git_branch)}")
+    if project_root:
+        parts.append(_project_filter(project_root, project_prefix))
+    return " and ".join(parts) if parts else None
+
+
+def _primary_key(doc_id: str) -> int:
+    return int(hashlib.sha256(doc_id.encode()).hexdigest()[:15], 16)
+
+
+def _ids_filter(doc_ids: Sequence[str]) -> str:
+    return "doc_id in [" + ", ".join(_literal(d) for d in doc_ids) + "]"
+
+
+# --- Scanning -----------------------------------------------------------------
+
+def _query(client: MilvusClient, filter_expr: str, output_fields: List[str],
+           limit: int = MILVUS_PAGE_MAX, offset: int = 0) -> List[Dict]:
+    return client.query(collection_name=COLLECTION_NAME, filter=filter_expr or "",
+                        output_fields=output_fields, limit=limit, offset=offset)
+
+
+def _scan_with(client: MilvusClient, output_fields: List[str],
+               filter_expr: Optional[str] = None) -> List[Dict]:
+    """Every matching row via an open client. Milvus limits one query window to
+    16384 rows, so the (uniformly distributed) primary-key space is bucketed."""
+    rows: List[Dict] = []
+    if not client.has_collection(COLLECTION_NAME):
+        return rows
+    step = (1 << _ID_BITS) // _SCAN_BUCKETS
+    for b in range(_SCAN_BUCKETS):
+        range_expr = f"id >= {b * step} and id < {(b + 1) * step}"
+        expr = f"({filter_expr}) and {range_expr}" if filter_expr else range_expr
+        batch = _query(client, expr, output_fields)
+        if len(batch) >= MILVUS_PAGE_MAX:
+            logger.warning("Scan bucket %d hit the Milvus page cap; results may be incomplete", b)
+        rows.extend(batch)
+    return rows
+
+
+def _count_with(client: MilvusClient, filter_expr: Optional[str] = None) -> int:
+    if not client.has_collection(COLLECTION_NAME):
+        return 0
+    try:
+        res = client.query(collection_name=COLLECTION_NAME, filter=filter_expr or "",
+                           output_fields=["count(*)"])
+        return int(res[0]["count(*)"])
+    except Exception as exc:
+        logger.debug("count(*) unsupported (%s); falling back to scan", exc)
+        return len(_scan_with(client, ["id"], filter_expr))
+
+
+def scan_all(output_fields: List[str], filter_expr: Optional[str] = None,
+             db_path: Optional[str] = None) -> List[Dict]:
+    with milvus_client(db_path) as client:
+        return _scan_with(client, output_fields, filter_expr)
+
+
+def count(filter_expr: Optional[str] = None, db_path: Optional[str] = None) -> int:
+    with milvus_client(db_path) as client:
+        return _count_with(client, filter_expr)
+
+
+def project_filter(project_root: str, prefix: bool = True) -> str:
+    """Public helper: Milvus filter for one project (and its subdirectories)."""
+    return _project_filter(project_root, prefix)
+
+
+# --- Writes -------------------------------------------------------------------
+
+def _fts_record(turn: Dict) -> Dict:
+    rec = {"doc_id": turn["doc_id"], "content": turn["text"]}
+    for col in FTS_METADATA:
+        rec[col] = turn.get(col, 0 if col == "turn_index" else "")
+    return rec
+
+
+def existing_doc_ids(doc_ids: Sequence[str], db_path: Optional[str] = None) -> set:
+    found = set()
+    with milvus_client(db_path) as client:
+        ids = list(dict.fromkeys(doc_ids))
+        for i in range(0, len(ids), 200):
+            chunk = ids[i:i + 200]
+            try:
+                rows = _query(client, _ids_filter(chunk), ["doc_id"], limit=len(chunk))
+                found.update(r["doc_id"] for r in rows)
+            except Exception as exc:
+                logger.warning("Dedup query failed (%s); assuming chunk is new", exc)
+    return found
+
 
 def add_turns(turns: List[Dict], db_path: Optional[str] = None) -> int:
-    """Insert conversation turn chunks into Milvus. Dedup by doc_id.
-
-    Each turn dict should have:
-        text, doc_id, session_id, transcript_file, turn_index,
-        timestamp, git_branch, chunk_type
-    """
+    """Embed and insert chunks. Existing doc_ids are skipped. Returns inserted count."""
     if not turns:
         return 0
-
-    # Dedup: check which doc_ids already exist
-    with milvus_client(db_path) as client:
-        existing_ids = set()
-        for turn in turns:
-            doc_id = turn["doc_id"]
-            try:
-                results = client.query(
-                    collection_name=COLLECTION_NAME,
-                    filter=f'doc_id == "{doc_id}"',
-                    limit=1,
-                    output_fields=["doc_id"],
-                )
-                if results:
-                    existing_ids.add(doc_id)
-            except Exception as e:
-                logger.warning("Dedup check failed for doc_id %s: %s", doc_id, e)
-
-    new_turns = [t for t in turns if t["doc_id"] not in existing_ids]
+    db_path = _resolve_db_path(db_path)
+    known = existing_doc_ids([t["doc_id"] for t in turns], db_path=db_path)
+    seen = set()
+    new_turns = []
+    for t in turns:
+        if t["doc_id"] in known or t["doc_id"] in seen:
+            continue
+        seen.add(t["doc_id"])
+        new_turns.append(t)
     if not new_turns:
         return 0
 
-    # Embed texts
-    texts = [t["text"] for t in new_turns]
-    embeddings = embed_texts(texts, is_query=False)
-
+    embeddings = _embedder.embed_documents([t["text"] for t in new_turns])
     data = []
     for turn, emb in zip(new_turns, embeddings):
-        # Stable hash: SHA-256 truncated to int64. Python's hash() is
-        # randomized per process, so the same doc_id would get different
-        # primary keys across server restarts.
-        int_id = int(hashlib.sha256(turn["doc_id"].encode()).hexdigest()[:15], 16)
-        data.append({
-            "id": int_id,
+        row = {
+            "id": _primary_key(turn["doc_id"]),
             "vector": emb,
             "document": turn["text"][:65535],
             "doc_id": turn["doc_id"],
-            "session_id": turn.get("session_id", ""),
-            "transcript_file": turn.get("transcript_file", ""),
-            "turn_index": turn.get("turn_index", 0),
-            "timestamp": turn.get("timestamp", ""),
-            "git_branch": turn.get("git_branch", ""),
-            "chunk_type": turn.get("chunk_type", "turn"),
-            "project_root": turn.get("project_root", ""),
-        })
+        }
+        for col in METADATA_FIELDS:
+            row[col] = turn.get(col, 0 if col == "turn_index" else "")
+        data.append(row)
 
     with milvus_client(db_path) as client:
         client.insert(collection_name=COLLECTION_NAME, data=data)
 
-    # Dual-write into FTS5 sidecar
     try:
-        if db_path:
-            fts_conn = _fts.connection(db_path)
-            fts_records = [{
-                "doc_id": t["doc_id"],
-                "content": t["text"],
-                "session_id": t.get("session_id", ""),
-                "git_branch": t.get("git_branch", ""),
-                "turn_index": t.get("turn_index", 0),
-                "timestamp": t.get("timestamp", ""),
-                "chunk_type": t.get("chunk_type", "turn"),
-                "project_root": t.get("project_root", ""),
-            } for t in new_turns]
-            _fts.insert(fts_conn, fts_records)
-            _fts.close_ephemeral(fts_conn)
-    except Exception as e:
-        logger.warning("FTS insert failed (non-fatal): %s", e)
-
+        conn = _fts.connection(db_path)
+        _fts.insert(conn, [_fts_record(t) for t in new_turns])
+        _fts.close_ephemeral(conn)
+    except Exception as exc:
+        logger.warning("FTS insert failed (non-fatal, backfilled at next start): %s", exc)
     return len(data)
+
+
+# --- Search -------------------------------------------------------------------
+
+def _hit_to_result(entity: Dict, similarity: Optional[float]) -> Dict:
+    result = {"content": entity.get("document", ""), "doc_id": entity.get("doc_id", "")}
+    for col in METADATA_FIELDS:
+        result[col] = entity.get(col, 0 if col == "turn_index" else "")
+    result["similarity"] = similarity
+    return result
+
+
+def _vector_search(client: MilvusClient, query_vec: List[float], limit: int,
+                   filter_expr: Optional[str]) -> List[Dict]:
+    res = client.search(collection_name=COLLECTION_NAME, data=[query_vec], limit=limit,
+                        filter=filter_expr, output_fields=OUTPUT_FIELDS)
+    hits = res[0] if res else []
+    return [_hit_to_result(h["entity"], float(h["distance"])) for h in hits]
+
+
+def _fill_similarity(client: MilvusClient, query_vec: List[float], results: List[Dict]) -> None:
+    """Compute cosine similarity for FTS-only hits so every result has one."""
+    missing = [r["doc_id"] for r in results if r.get("similarity") is None and r.get("doc_id")]
+    if not missing:
+        return
+    try:
+        rows = _query(client, _ids_filter(missing), ["doc_id", "vector"], limit=len(missing))
+    except Exception as exc:
+        logger.debug("Could not fetch vectors for FTS hits: %s", exc)
+        return
+    vectors = {r["doc_id"]: r["vector"] for r in rows}
+    for r in results:
+        vec = vectors.get(r.get("doc_id"))
+        if r.get("similarity") is None and vec is not None:
+            r["similarity"] = float(sum(a * b for a, b in zip(query_vec, vec)))
+
+
+def _apply_recency_boost(results: List[Dict]) -> None:
+    """score *= 1 + w * recency, recency = rank of timestamp among candidates in [0,1]."""
+    stamps = sorted({r["timestamp"] for r in results if r.get("timestamp")})
+    if len(stamps) < 2:
+        return
+    rank = {ts: i / (len(stamps) - 1) for i, ts in enumerate(stamps)}
+    for r in results:
+        recency = rank.get(r.get("timestamp"), 0.5)
+        r["score"] = r["score"] * (1.0 + RECENCY_WEIGHT * recency)
 
 
 def search(query: str, n: int = 5, session_id: Optional[str] = None,
            git_branch: Optional[str] = None, project_root: Optional[str] = None,
-           recency_boost: bool = False,
-           db_path: Optional[str] = None) -> List[Dict]:
-    """Hybrid search: vector similarity + FTS5 keyword search, merged with RRF.
+           recency_boost: bool = False, db_path: Optional[str] = None,
+           project_prefix: bool = True) -> List[Dict]:
+    """Hybrid search. `project_root=None` searches every project; otherwise the
+    project and (with project_prefix) anything launched from a subdirectory of it.
 
-    Both engines run with an expanded candidate pool (n*3), then RRF merges
-    the two ranked lists. Recency boost is applied after merging.
-
-    project_root: when set, restricts results to that project. When None,
-    searches across all projects (cross-project search).
+    Each result carries `score` (RRF fusion score normalised to (0, 1], boosted
+    by recency when requested) and `similarity` (cosine, 1.0 = identical).
     """
-    # Expanded candidate pool for both engines
-    fetch_n = n * 3
-
-    # --- Vector search ---
-    query_embedding = embed_texts([query], is_query=True)[0]
-
-    filters = []
-    if session_id:
-        filters.append(f'session_id == "{session_id}"')
-    if git_branch:
-        filters.append(f'git_branch == "{git_branch}"')
-    if project_root:
-        filters.append(f'project_root == "{project_root}"')
-    filter_expr = " && ".join(filters) if filters else None
+    n = max(1, min(int(n), MAX_RESULTS))
+    fetch_n = min(max(n * 3, 10), 60)
+    db_path = _resolve_db_path(db_path)
+    query_vec = _embedder.embed_query(query)
 
     with milvus_client(db_path) as client:
-        results = client.search(
-            collection_name=COLLECTION_NAME,
-            data=[query_embedding],
-            limit=fetch_n,
-            filter=filter_expr,
-            output_fields=["document", "doc_id", "session_id", "transcript_file",
-                           "turn_index", "timestamp", "git_branch", "chunk_type",
-                           "project_root"],
-        )
+        filter_expr = _build_filter(session_id, git_branch, project_root, project_prefix)
+        try:
+            vector_results = _vector_search(client, query_vec, fetch_n, filter_expr)
+        except Exception as exc:
+            if project_root and project_prefix:
+                logger.warning("Prefix filter failed (%s); retrying with exact project match", exc)
+                filter_expr = _build_filter(session_id, git_branch, project_root, False)
+                vector_results = _vector_search(client, query_vec, fetch_n, filter_expr)
+                project_prefix = False
+            else:
+                raise
 
-    vector_results = []
-    if results and results[0]:
-        for hit in results[0]:
-            entity = hit["entity"]
-            vector_results.append({
-                "content": entity["document"],
-                "doc_id": entity.get("doc_id", ""),
-                "session_id": entity.get("session_id", ""),
-                "transcript_file": entity.get("transcript_file", ""),
-                "turn_index": entity.get("turn_index", 0),
-                "timestamp": entity.get("timestamp", ""),
-                "git_branch": entity.get("git_branch", ""),
-                "chunk_type": entity.get("chunk_type", ""),
-                "project_root": entity.get("project_root", ""),
-                "distance": hit["distance"],
-            })
+        fts_filters = {k: v for k, v in (("session_id", session_id), ("git_branch", git_branch)) if v}
+        prefix_filters = {}
+        if project_root:
+            if project_prefix:
+                prefix_filters["project_root"] = project_root
+            else:
+                fts_filters["project_root"] = project_root
+        fts_results = _fts.search(query, n=fetch_n, filters=fts_filters or None,
+                                  prefix_filters=prefix_filters or None, db_path=db_path)
 
-    # --- FTS5 keyword search ---
-    fts_filters = {}
-    if session_id:
-        fts_filters["session_id"] = session_id
-    if git_branch:
-        fts_filters["git_branch"] = git_branch
-    if project_root:
-        fts_filters["project_root"] = project_root
-    fts_results = _fts.search(query, n=fetch_n, filters=fts_filters or None, db_path=db_path)
+        merged = rrf_merge(vector_results, fts_results, n=fetch_n, k=RRF_K)
+        if not merged:
+            return []
+        _fill_similarity(client, query_vec, merged)
 
-    # --- Merge with RRF ---
-    if fts_results and vector_results:
-        # Both engines returned results — merge
-        merged = rrf_merge(vector_results, fts_results, n=fetch_n)
-    elif fts_results:
-        merged = fts_results
-    else:
-        merged = vector_results
-
-    if not merged:
-        return []
-
-    # Clean up internal RRF score before recency boost
+    max_rrf = 2.0 / (RRF_K + 1)
     for r in merged:
-        r.pop("_rrf_score", None)
-
-    if recency_boost and merged:
-        merged = _apply_recency_boost(merged, n)
-
+        r["score"] = r.pop("_rrf_score", 0.0) / max_rrf
+        r.pop("bm25", None)
+        r.setdefault("content", "")
+    if recency_boost:
+        _apply_recency_boost(merged)
+    merged.sort(key=lambda r: r["score"], reverse=True)
     return merged[:n]
 
 
-def _apply_recency_boost(results: List[Dict], n: int) -> List[Dict]:
-    """Re-rank results by combining semantic similarity with recency.
-
-    Score = similarity * (1 + recency_weight * recency_factor)
-    where recency_factor is 1.0 for the newest result and 0.0 for the oldest.
-    """
-    recency_weight = 0.3
-
-    # Parse timestamps and sort to find range
-    timestamps = []
-    for r in results:
-        ts = r.get("timestamp", "")
-        if ts:
-            try:
-                # ISO 8601 strings sort lexicographically
-                timestamps.append(ts)
-            except Exception:
-                timestamps.append("")
-        else:
-            timestamps.append("")
-
-    if not any(timestamps):
-        return results
-
-    valid_ts = [t for t in timestamps if t]
-    if len(valid_ts) < 2:
-        return results
-
-    ts_min = min(valid_ts)
-    ts_max = max(valid_ts)
-
-    for i, r in enumerate(results):
-        similarity = 1 - r["distance"]  # COSINE distance → similarity
-        ts = timestamps[i]
-        if ts and ts_min != ts_max:
-            # Normalize timestamp to [0, 1] range
-            recency = (valid_ts.index(ts) if ts in valid_ts else 0) / max(len(valid_ts) - 1, 1)
-            # Simple linear approach: newer timestamps get higher recency
-            # Since ISO strings sort ascending, higher position = newer
-            all_sorted = sorted(valid_ts)
-            try:
-                pos = all_sorted.index(ts)
-                recency = pos / max(len(all_sorted) - 1, 1)
-            except ValueError:
-                recency = 0.5
-        else:
-            recency = 0.5
-
-        r["_score"] = similarity * (1 + recency_weight * recency)
-
-    results.sort(key=lambda r: r.get("_score", 0), reverse=True)
-
-    # Clean up internal score
-    for r in results:
-        r.pop("_score", None)
-
-    return results
-
-
 def get_turns(session_id: str, turn_index: int, context: int = 2,
-              db_path: Optional[str] = None) -> List[Dict]:
-    """Retrieve turns around a specific turn_index within a session.
-
-    turn_index is a byte offset into the transcript file. context is the
-    number of neighboring turns (before and after) to include. We fetch all
-    turns for the session, sort by turn_index, find the target, and return
-    the surrounding window.
-
-    Returns turns sorted by turn_index ascending, with the same field
-    mapping as search() (document → content).
-    """
+              db_path: Optional[str] = None, transcript_file: Optional[str] = None) -> List[Dict]:
+    """Return the chunks around `turn_index` (a byte offset) in one transcript of a session."""
+    context = max(0, min(int(context), 20))
     with milvus_client(db_path) as client:
-        results = client.query(
-            collection_name=COLLECTION_NAME,
-            filter=f'session_id == "{session_id}"',
-            output_fields=["document", "doc_id", "session_id", "transcript_file",
-                           "turn_index", "timestamp", "git_branch", "chunk_type"],
-            limit=16384,
-        )
-
-    if not results:
+        rows = _query(client, _build_filter(session_id=session_id), OUTPUT_FIELDS)
+    if not rows:
         return []
-
-    # Sort all turns by turn_index (byte offset)
-    results.sort(key=lambda r: r.get("turn_index", 0))
-
-    # Find the target turn (closest match to requested turn_index)
-    target_idx = 0
-    min_dist = float("inf")
-    for i, row in enumerate(results):
-        dist = abs(row.get("turn_index", 0) - turn_index)
-        if dist < min_dist:
-            min_dist = dist
-            target_idx = i
-
-    # Extract window: context turns before and after
-    start = max(0, target_idx - context)
-    end = min(len(results), target_idx + context + 1)
-
-    formatted = []
-    for row in results[start:end]:
-        formatted.append({
-            "content": row["document"],
-            "doc_id": row.get("doc_id", ""),
-            "session_id": row.get("session_id", ""),
-            "transcript_file": row.get("transcript_file", ""),
-            "turn_index": row.get("turn_index", 0),
-            "timestamp": row.get("timestamp", ""),
-            "git_branch": row.get("git_branch", ""),
-            "chunk_type": row.get("chunk_type", ""),
-        })
-
-    return formatted
+    if transcript_file:
+        rows = [r for r in rows if r.get("transcript_file") == transcript_file] or rows
+    rows.sort(key=lambda r: (r.get("transcript_file", ""), r.get("turn_index", 0)))
+    target = min(range(len(rows)), key=lambda i: abs(rows[i].get("turn_index", 0) - turn_index))
+    target_file = rows[target].get("transcript_file", "")
+    rows = [r for r in rows if r.get("transcript_file", "") == target_file]
+    target = min(range(len(rows)), key=lambda i: abs(rows[i].get("turn_index", 0) - turn_index))
+    window = rows[max(0, target - context): target + context + 1]
+    return [_hit_to_result(r, None) for r in window]
 
 
-def get_stats(project_root: Optional[str] = None, db_path: Optional[str] = None) -> Dict:
-    """Get index statistics. Optionally filter to a specific project."""
-    with milvus_client(db_path) as client:
-        if not client.has_collection(COLLECTION_NAME):
-            return {"total_turns": 0, "sessions": 0, "by_type": {}}
+# --- Stats ----------------------------------------------------------------------
 
-    # Query for breakdowns (capped by Milvus offset limit)
-    all_results = _query_all(
-        ["session_id", "chunk_type", "git_branch", "project_root"],
-        filter_expr=f'project_root == "{project_root}"' if project_root else None,
-        db_path=db_path,
-    )
-
-    total = len(all_results)
-    sessions = set(r["session_id"] for r in all_results if r.get("session_id"))
-    branches = set(r["git_branch"] for r in all_results if r.get("git_branch"))
-
-    by_type = {}
-    for r in all_results:
-        t = r.get("chunk_type", "unknown")
-        by_type[t] = by_type.get(t, 0) + 1
-
-    return {
-        "total_turns": total,
-        "sessions": len(sessions),
-        "branches": sorted(branches),
-        "by_type": by_type,
-    }
+def get_stats(project_root: Optional[str] = None, db_path: Optional[str] = None,
+              project_prefix: bool = True) -> Dict:
+    filter_expr = _project_filter(project_root, project_prefix) if project_root else None
+    rows = scan_all(["session_id", "chunk_type", "git_branch", "project_root"],
+                    filter_expr=filter_expr, db_path=db_path)
+    sessions = {r["session_id"] for r in rows if r.get("session_id")}
+    branches = {r["git_branch"] for r in rows if r.get("git_branch")}
+    projects = {r["project_root"] for r in rows if r.get("project_root")}
+    by_type: Dict[str, int] = {}
+    for r in rows:
+        by_type[r.get("chunk_type") or "unknown"] = by_type.get(r.get("chunk_type") or "unknown", 0) + 1
+    return {"total_turns": len(rows), "sessions": len(sessions), "branches": sorted(branches),
+            "projects": sorted(projects), "by_type": by_type}
 
 
-def _query_all(output_fields: list, batch_size: int = 1000,
-               filter_expr: Optional[str] = None,
-               db_path: Optional[str] = None) -> list:
-    """Query all rows with offset pagination. Optional filter expression."""
-    MILVUS_MAX = 16384
-    all_results = []
-    offset = 0
-
-    with milvus_client(db_path) as client:
-        if not client.has_collection(COLLECTION_NAME):
-            return []
-        while offset < MILVUS_MAX:
-            effective_limit = min(batch_size, MILVUS_MAX - offset)
-            batch = client.query(
-                collection_name=COLLECTION_NAME,
-                filter=filter_expr or "",
-                limit=effective_limit,
-                offset=offset,
-                output_fields=output_fields,
-            )
-            if not batch:
-                break
-            all_results.extend(batch)
-            if len(batch) < effective_limit:
-                break
-            offset += effective_limit
-
-    return all_results
-
-
-# --- Cleanup operations ---
-
-def delete_by_session(session_id: str, db_path: Optional[str] = None) -> int:
-    """Delete all turns for a given session ID."""
-    with milvus_client(db_path) as client:
-        results = client.query(
-            collection_name=COLLECTION_NAME,
-            filter=f'session_id == "{session_id}"',
-            output_fields=["id"],
-        )
-        if results:
-            client.delete(
-                collection_name=COLLECTION_NAME,
-                filter=f'session_id == "{session_id}"',
-            )
-
-    # Also delete from FTS
-    try:
-        if db_path:
-            conn = _fts.connection(db_path)
-            _fts.delete(conn, "session_id", session_id)
-            _fts.close_ephemeral(conn)
-    except Exception as e:
-        logger.warning("FTS delete by session failed (non-fatal): %s", e)
-
-    return len(results)
-
-
-def delete_by_branch(git_branch: str, db_path: Optional[str] = None) -> int:
-    """Delete all turns for a given git branch."""
-    with milvus_client(db_path) as client:
-        results = client.query(
-            collection_name=COLLECTION_NAME,
-            filter=f'git_branch == "{git_branch}"',
-            output_fields=["id"],
-        )
-        if results:
-            client.delete(
-                collection_name=COLLECTION_NAME,
-                filter=f'git_branch == "{git_branch}"',
-            )
-
-    # Also delete from FTS
-    try:
-        if db_path:
-            conn = _fts.connection(db_path)
-            _fts.delete(conn, "git_branch", git_branch)
-            _fts.close_ephemeral(conn)
-    except Exception as e:
-        logger.warning("FTS delete by branch failed (non-fatal): %s", e)
-
-    return len(results)
-
-
-def delete_older_than(max_age_days: int, db_path: Optional[str] = None) -> int:
-    """Delete all turns with timestamps older than max_age_days ago.
-
-    Returns the number of deleted turns.
-    """
-    from datetime import datetime, timedelta, timezone
-
-    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
-    cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
-
-    # Milvus Lite varchar comparison works lexicographically,
-    # and ISO 8601 timestamps sort correctly this way.
-    with milvus_client(db_path) as client:
-        if not client.has_collection(COLLECTION_NAME):
-            return 0
-
-        # Query to count before deleting
-        results = client.query(
-            collection_name=COLLECTION_NAME,
-            filter=f'timestamp < "{cutoff_str}" && timestamp != ""',
-            output_fields=["id"],
-            limit=16384,
-        )
-        if results:
-            client.delete(
-                collection_name=COLLECTION_NAME,
-                filter=f'timestamp < "{cutoff_str}" && timestamp != ""',
-            )
-
-    # Also delete from FTS
-    try:
-        if db_path:
-            conn = _fts.connection(db_path)
-            _fts.delete_where(conn, "timestamp < ? AND timestamp != ''", (cutoff_str,))
-            _fts.close_ephemeral(conn)
-    except Exception as e:
-        logger.warning("FTS delete older_than failed (non-fatal): %s", e)
-
-    return len(results)
-
-
-def backfill_fts(db_path: Optional[str] = None) -> int:
-    """Populate FTS from Milvus for any records missing from the FTS index.
-
-    Queries all doc_ids from Milvus, checks which are absent from FTS,
-    and inserts the missing ones. Returns count of backfilled records.
-    """
-    if not db_path:
-        return 0
-
-    all_rows = _query_all(
-        ["doc_id", "document", "session_id", "git_branch", "turn_index",
-         "timestamp", "chunk_type", "project_root"],
-        db_path=db_path,
-    )
-    if not all_rows:
-        return 0
-
-    fts_conn = _fts.connection(db_path)
-
-    # Find which doc_ids are already in FTS
-    existing = set()
-    for row in all_rows:
-        doc_id = row.get("doc_id", "")
-        if doc_id:
-            hit = fts_conn.execute(
-                f"SELECT doc_id FROM {_fts.table_name} WHERE doc_id = ?", (doc_id,)
-            ).fetchone()
-            if hit:
-                existing.add(doc_id)
-
-    missing = [r for r in all_rows if r.get("doc_id", "") not in existing]
-    if not missing:
-        _fts.close_ephemeral(fts_conn)
-        return 0
-
-    records = [{
-        "doc_id": r["doc_id"],
-        "content": r.get("document", ""),
-        "session_id": r.get("session_id", ""),
-        "git_branch": r.get("git_branch", ""),
-        "turn_index": r.get("turn_index", 0),
-        "timestamp": r.get("timestamp", ""),
-        "chunk_type": r.get("chunk_type", "turn"),
-        "project_root": r.get("project_root", ""),
-    } for r in missing]
-
-    _fts.insert(fts_conn, records)
-    _fts.close_ephemeral(fts_conn)
-
-    logger.info("FTS backfill: inserted %d records", len(records))
-    return len(records)
-
-
-def clear_collection(db_path: Optional[str] = None):
-    """Drop and recreate the collection (full reset). Also clears FTS."""
-    with milvus_client(db_path) as client:
-        if client.has_collection(COLLECTION_NAME):
-            client.drop_collection(COLLECTION_NAME)
-            print(f"Collection dropped: {COLLECTION_NAME}", file=sys.stderr)
-
-    # Clear FTS database
-    if db_path:
-        _fts.clear(db_path)
-
-
-def list_sessions(project_root: Optional[str] = None,
-                  db_path: Optional[str] = None) -> List[Dict]:
-    """List all sessions with turn counts and date ranges. Optionally filter by project."""
-    all_results = _query_all(
-        ["session_id", "timestamp", "git_branch", "chunk_type", "project_root"],
-        filter_expr=f'project_root == "{project_root}"' if project_root else None,
-        db_path=db_path,
-    )
-
+def list_sessions(project_root: Optional[str] = None, db_path: Optional[str] = None) -> List[Dict]:
+    filter_expr = _project_filter(project_root, True) if project_root else None
+    rows = scan_all(["session_id", "timestamp", "git_branch", "chunk_type", "project_root"],
+                    filter_expr=filter_expr, db_path=db_path)
     sessions: Dict[str, Dict] = {}
-    for r in all_results:
-        sid = r.get("session_id", "")
+    for r in rows:
+        sid = r.get("session_id")
         if not sid:
             continue
-        if sid not in sessions:
-            sessions[sid] = {
-                "session_id": sid,
-                "turns": 0,
-                "branches": set(),
-                "min_ts": "",
-                "max_ts": "",
-            }
-        s = sessions[sid]
+        s = sessions.setdefault(sid, {"session_id": sid, "turns": 0, "branches": set(),
+                                      "min_ts": "", "max_ts": "", "project_root": r.get("project_root", "")})
         s["turns"] += 1
-        branch = r.get("git_branch", "")
-        if branch:
-            s["branches"].add(branch)
+        if r.get("git_branch"):
+            s["branches"].add(r["git_branch"])
         ts = r.get("timestamp", "")
         if ts:
-            if not s["min_ts"] or ts < s["min_ts"]:
-                s["min_ts"] = ts
-            if not s["max_ts"] or ts > s["max_ts"]:
-                s["max_ts"] = ts
-
+            s["min_ts"] = min(s["min_ts"] or ts, ts)
+            s["max_ts"] = max(s["max_ts"], ts)
     result = []
     for s in sessions.values():
         s["branches"] = sorted(s["branches"])
         result.append(s)
-
-    # Sort by most recent first
     result.sort(key=lambda s: s["max_ts"], reverse=True)
     return result
 
 
-# --- Async wrappers ---
+# --- Deletes --------------------------------------------------------------------
 
-async def search_async(query: str, n: int = 5, session_id: Optional[str] = None,
-                       git_branch: Optional[str] = None, project_root: Optional[str] = None,
-                       recency_boost: bool = False,
-                       db_path: Optional[str] = None) -> List[Dict]:
-    """Async search with embed semaphore."""
-    loop = asyncio.get_event_loop()
+def _delete_where(filter_expr: str, fts_where: str, fts_params: tuple,
+                  db_path: Optional[str] = None) -> int:
+    db_path = _resolve_db_path(db_path)
+    with milvus_client(db_path) as client:
+        if not client.has_collection(COLLECTION_NAME):
+            return 0
+        before = _count_with(client, filter_expr)
+        if before:
+            client.delete(collection_name=COLLECTION_NAME, filter=filter_expr)
+    try:
+        conn = _fts.connection(db_path)
+        _fts.delete_where(conn, fts_where, fts_params)
+        _fts.close_ephemeral(conn)
+    except Exception as exc:
+        logger.warning("FTS delete failed (non-fatal): %s", exc)
+    return before
 
-    if _embed_semaphore is not None:
-        async with _embed_semaphore:
-            return await loop.run_in_executor(
-                None, lambda: search(query, n, session_id, git_branch, project_root, recency_boost, db_path))
-    else:
-        return await loop.run_in_executor(
-            None, lambda: search(query, n, session_id, git_branch, project_root, recency_boost, db_path))
+
+def delete_by_session(session_id: str, db_path: Optional[str] = None) -> int:
+    return _delete_where(f"session_id == {_literal(session_id)}", "session_id = ?", (session_id,), db_path)
 
 
-async def add_turns_async(turns: List[Dict], db_path: Optional[str] = None) -> int:
-    """Async add_turns with embed semaphore + write lock."""
-    loop = asyncio.get_event_loop()
+def delete_by_branch(git_branch: str, db_path: Optional[str] = None) -> int:
+    return _delete_where(f"git_branch == {_literal(git_branch)}", "git_branch = ?", (git_branch,), db_path)
 
-    if _embed_semaphore is not None and _write_lock is not None:
-        async with _embed_semaphore:
-            async with _write_lock:
-                return await loop.run_in_executor(None, lambda: add_turns(turns, db_path))
-    else:
-        return await loop.run_in_executor(None, lambda: add_turns(turns, db_path))
+
+def delete_older_than(max_age_days: int, db_path: Optional[str] = None) -> int:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=int(max_age_days))).strftime("%Y-%m-%dT%H:%M:%S")
+    return _delete_where(f'timestamp < "{cutoff}" and timestamp != ""',
+                         "timestamp < ? AND timestamp != ''", (cutoff,), db_path)
+
+
+def delete_noise(db_path: Optional[str] = None) -> int:
+    """Remove chunks that only contain Claude Code command/markup echoes."""
+    db_path = _resolve_db_path(db_path)
+    total = 0
+    for prefix in NOISE_PREFIXES:
+        like = prefix.replace("%", "") + "%"
+        total += _delete_where(f"document like {_literal(like)}", "content LIKE ? ESCAPE '\\'",
+                               (like.replace("_", "\\_"),), db_path)
+    return total
+
+
+def clear_collection(db_path: Optional[str] = None) -> None:
+    """Drop the collection and the FTS database (full reset)."""
+    db_path = _resolve_db_path(db_path)
+    with milvus_client(db_path, ensure=False) as client:
+        if client.has_collection(COLLECTION_NAME):
+            client.drop_collection(COLLECTION_NAME)
+            logger.info("Collection dropped: %s", COLLECTION_NAME)
+    _fts.clear(db_path)
+    if IDENTITY_FILE.exists():
+        IDENTITY_FILE.unlink()
+
+
+# --- Maintenance ------------------------------------------------------------------
+
+def backfill_fts(db_path: Optional[str] = None) -> int:
+    """Insert into FTS any Milvus rows it is missing (e.g. after an FTS schema rebuild)."""
+    db_path = _resolve_db_path(db_path)
+    rows = scan_all(["doc_id", "document"] + METADATA_FIELDS, db_path=db_path)
+    if not rows:
+        return 0
+    conn = _fts.connection(db_path)
+    try:
+        present = _fts.existing_doc_ids(conn, [r["doc_id"] for r in rows if r.get("doc_id")])
+        missing = [r for r in rows if r.get("doc_id") and r["doc_id"] not in present]
+        if not missing:
+            return 0
+        records = []
+        for r in missing:
+            rec = {"doc_id": r["doc_id"], "content": r.get("document", "")}
+            for col in FTS_METADATA:
+                rec[col] = r.get(col, 0 if col == "turn_index" else "")
+            records.append(rec)
+        inserted = _fts.insert(conn, records)
+    finally:
+        _fts.close_ephemeral(conn)
+    logger.info("FTS backfill inserted %d records", inserted)
+    return inserted
+
+
+def reembed_all(db_path: Optional[str] = None, batch_size: int = 64,
+                progress: Optional[Callable[[str], None]] = None,
+                skip_noise: bool = True) -> int:
+    """Rebuild every vector with the active model, using the FTS table as the text source.
+
+    All embeddings are computed before the old collection is dropped, so a
+    failure part-way leaves the existing index untouched.
+    """
+    db_path = _resolve_db_path(db_path)
+    log = progress or (lambda msg: logger.info(msg))
+    conn = _fts.connection(db_path)
+    try:
+        total = _fts.count(conn)
+        log(f"Re-embedding {total} chunks with {_spec.name} ({_spec.model_id}, {_spec.dim}d)...")
+        rows_out: List[Dict] = []
+        done = 0
+        started = time.time()
+        for batch in _fts.iter_all(conn, batch_size=batch_size):
+            if skip_noise:
+                batch = [r for r in batch if not str(r.get("content", "")).startswith(NOISE_PREFIXES)]
+            if not batch:
+                continue
+            vectors = _embedder.embed_documents([r["content"] for r in batch])
+            for r, vec in zip(batch, vectors):
+                row = {"id": _primary_key(r["doc_id"]), "vector": vec,
+                       "document": r["content"][:65535], "doc_id": r["doc_id"]}
+                for col in METADATA_FIELDS:
+                    row[col] = r.get(col, 0 if col == "turn_index" else "")
+                row["turn_index"] = int(row["turn_index"] or 0)
+                rows_out.append(row)
+            done += len(batch)
+            if done % (batch_size * 8) < len(batch):
+                rate = done / max(time.time() - started, 1e-6)
+                log(f"  {done}/{total} embedded ({rate:.0f}/s)")
+        if skip_noise and done < total:
+            skipped = [r["doc_id"] for b in _fts.iter_all(conn) for r in b
+                       if str(r.get("content", "")).startswith(NOISE_PREFIXES)]
+            if skipped:
+                _fts.delete_doc_ids(conn, skipped)
+                log(f"  dropped {len(skipped)} noise chunks")
+    finally:
+        _fts.close_ephemeral(conn)
+
+    with milvus_client(db_path, ensure=False) as client:
+        if client.has_collection(COLLECTION_NAME):
+            client.drop_collection(COLLECTION_NAME)
+        _ensure_collection(client)
+        for i in range(0, len(rows_out), 500):
+            client.insert(collection_name=COLLECTION_NAME, data=rows_out[i:i + 500])
+    stamp_identity()
+    log(f"Done: {len(rows_out)} chunks re-embedded")
+    return len(rows_out)

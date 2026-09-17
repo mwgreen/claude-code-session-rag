@@ -1,8 +1,9 @@
 #!/bin/bash
-# Setup script for session-rag on Apple Silicon Mac.
-# Single command to install everything: venv, deps, model, and verify.
+# One-command install for session-rag on Apple Silicon:
+# venv + dependencies, embedding model download, self-test, Claude Code hooks
+# and the global MCP server entry.
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -12,271 +13,174 @@ echo "Session-RAG Setup for Apple Silicon Mac"
 echo "======================================================================"
 echo ""
 
-# --- Check prerequisites ---
+# --- Prerequisites ---
 echo "Checking prerequisites..."
-
-if [[ $(uname) != "Darwin" ]]; then
-    echo "Error: This script is for macOS only"
-    exit 1
+if [[ $(uname) != "Darwin" ]]; then echo "Error: macOS only"; exit 1; fi
+if [[ $(uname -m) != "arm64" ]]; then echo "Error: Apple Silicon required"; exit 1; fi
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "Error: python3 not found. Install with: brew install python@3.12"; exit 1
 fi
-
-if [[ $(uname -m) != "arm64" ]]; then
-    echo "Error: This script requires Apple Silicon (M1/M2/M3/M4)"
-    exit 1
+PY_VERSION=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+echo "  Python $PY_VERSION  |  macOS $(sw_vers -productVersion)"
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
+    echo "Error: Python 3.11+ required"; exit 1
 fi
-
-if ! command -v python3 &> /dev/null; then
-    echo "Error: python3 not found. Install with: brew install python@3.12"
-    exit 1
-fi
-
-PYTHON_VERSION=$(python3 --version | cut -d' ' -f2)
-PYTHON_MAJOR_MINOR=$(echo "$PYTHON_VERSION" | cut -d'.' -f1,2)
-echo "  Python $PYTHON_VERSION"
-
-MACOS_VERSION=$(sw_vers -productVersion | cut -d'.' -f1)
-echo "  macOS $MACOS_VERSION"
 echo ""
 
-# --- Create virtual environment ---
+# --- Virtual environment ---
 echo "Creating virtual environment..."
-if [ -d "venv" ]; then
-    echo "  venv already exists, using existing"
-else
-    python3 -m venv venv
-    echo "  venv created"
-fi
-
+if [ -d venv ]; then echo "  venv already exists, using it"; else python3 -m venv venv; echo "  venv created"; fi
+# shellcheck disable=SC1091
 source venv/bin/activate
 
 echo ""
-echo "Installing dependencies..."
-echo "  This may take 1-2 minutes on first run..."
-
+echo "Installing dependencies (1-2 minutes on first run)..."
 pip install --quiet --upgrade pip
+pip install --quiet -r requirements.txt
+echo "  Dependencies installed"
 
-echo "  Installing Milvus Lite..."
-pip install --quiet "setuptools>=70.0,<82.0" "pymilvus[milvus-lite]>=2.6.0"
-
-echo "  Installing MLX embeddings..."
-pip install --quiet "mlx>=0.30.0" mlx-embeddings "transformers<5.0"
-
-echo "  Installing MCP + HTTP server..."
-pip install --quiet "mcp>=1.0.0,<2.0" starlette uvicorn httpx "watchdog>=4.0.0"
-
-echo "  All dependencies installed"
-
-# --- Download model ---
+# --- Model ---
 echo ""
 SESSION_RAG_MODEL="${SESSION_RAG_MODEL:-embeddinggemma}"
-echo "Downloading embedding model ($SESSION_RAG_MODEL)..."
-chmod +x "$SCRIPT_DIR/download-model.sh"
-SESSION_RAG_MODEL="$SESSION_RAG_MODEL" "$SCRIPT_DIR/download-model.sh"
-
-# --- Test installation ---
-echo ""
-echo "Testing installation..."
-
-SESSION_RAG_MODEL="$SESSION_RAG_MODEL" python3 << 'PYEOF'
-import sys
-sys.path.insert(0, '.')
-
-try:
-    import rag_engine
-    import transcript_parser
-    import file_watcher
-    import tools
-    print("  All imports successful")
-except Exception as e:
-    print(f"  Import failed: {e}")
-    sys.exit(1)
-
-try:
-    emb = rag_engine.embed_texts(["test embedding"])
-    dim = len(emb[0])
-    expected = rag_engine._EMBED_DIM
-    assert dim == expected, f"Expected {expected} dims, got {dim}"
-    print(f"  Embedding works ({dim} dimensions, model: {rag_engine.get_model_name()})")
-except Exception as e:
-    print(f"  Embedding test failed: {e}")
-    sys.exit(1)
-
-print("")
-print("  All tests passed!")
-PYEOF
-
-if [ $? -ne 0 ]; then
-    echo "Installation test failed"
-    exit 1
+export SESSION_RAG_MODEL
+chmod +x "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR/index_hook.py"
+if venv/bin/python -c "import embedder,sys; sys.exit(0 if embedder.get_spec().is_downloaded() else 1)" 2>/dev/null; then
+    echo "Embedding model '$SESSION_RAG_MODEL' already downloaded."
+else
+    echo "Downloading embedding model '$SESSION_RAG_MODEL'..."
+    "$SCRIPT_DIR/download-model.sh" "$SESSION_RAG_MODEL"
 fi
 
-# --- Make scripts executable ---
-chmod +x "$SCRIPT_DIR/session-rag-server.sh"
-chmod +x "$SCRIPT_DIR/download-model.sh"
-chmod +x "$SCRIPT_DIR/index_hook.py"
+# --- Self-test ---
+echo ""
+echo "Testing installation..."
+venv/bin/python - << 'PYEOF'
+import sys
+sys.path.insert(0, '.')
+import embedder, rag_engine, transcript_parser, indexer, file_watcher, tools, http_server  # noqa: F401
+print("  All imports successful")
+spec = rag_engine.model_spec()
+vec = rag_engine.embed_texts(["test embedding"])[0]
+assert len(vec) == spec.dim, f"expected {spec.dim} dims, got {len(vec)}"
+print(f"  Embedding works ({len(vec)} dimensions, model: {spec.name})")
+PYEOF
+venv/bin/python -m unittest discover -s tests -q 2>&1 | grep -v -iE 'pkg_resources|UserWarning|^\s*from pkg' | tail -1
 
-# --- Install hooks into ~/.claude/settings.json ---
+# --- Hooks in ~/.claude/settings.json ---
 echo ""
 echo "Installing hooks into ~/.claude/settings.json..."
-
 VENV_PYTHON="$SCRIPT_DIR/venv/bin/python"
 SETTINGS_FILE="$HOME/.claude/settings.json"
+SCRIPT_DIR="$SCRIPT_DIR" VENV_PYTHON="$VENV_PYTHON" SETTINGS_FILE="$SETTINGS_FILE" python3 - << 'PYEOF'
+import json, os
+settings_file = os.environ["SETTINGS_FILE"]
+script_dir = os.environ["SCRIPT_DIR"]
+venv_python = os.environ["VENV_PYTHON"]
 
-python3 << PYEOF
-import json
-import os
-import sys
-
-settings_file = "$SETTINGS_FILE"
-script_dir = "$SCRIPT_DIR"
-venv_python = "$VENV_PYTHON"
-
-# Our hooks to install
 our_hooks = {
     "SessionStart": [
-        {
-            "type": "command",
-            "command": f"{script_dir}/session-rag-server.sh start",
-            "timeout": 30000,
-        },
-        {
-            "type": "command",
-            "command": f"{script_dir}/session_start_hook.sh",
-            "timeout": 5000,
-        },
+        {"type": "command", "command": f"{script_dir}/session-rag-server.sh start", "timeout": 90000},
+        {"type": "command", "command": f"{script_dir}/session_start_hook.sh", "timeout": 10000},
     ],
-    "Stop": [
-        {
-            "type": "command",
-            "command": f"{venv_python} {script_dir}/index_hook.py",
-            "timeout": 15000,
-        },
-    ],
-    "PreCompact": [
-        {
-            "type": "command",
-            "command": f"{venv_python} {script_dir}/index_hook.py",
-            "timeout": 30000,
-        },
-    ],
+    "Stop": [{"type": "command", "command": f"{venv_python} {script_dir}/index_hook.py", "timeout": 15000}],
+    "PreCompact": [{"type": "command", "command": f"{venv_python} {script_dir}/index_hook.py", "timeout": 30000}],
 }
 
-# Load existing settings
 os.makedirs(os.path.dirname(settings_file), exist_ok=True)
+settings = {}
 if os.path.exists(settings_file):
     with open(settings_file) as f:
         settings = json.load(f)
-else:
-    settings = {}
-
 hooks = settings.setdefault("hooks", {})
-
-for event, new_hook_entries in our_hooks.items():
-    # Get or create the event's hook groups array
+for event, entries in our_hooks.items():
     groups = hooks.setdefault(event, [])
-
-    # Find or create a hook group (we use the first group)
     if not groups:
         groups.append({"hooks": []})
-    group = groups[0]
-    existing = group.setdefault("hooks", [])
-
-    # Collect existing commands to avoid duplicates
-    existing_commands = {h.get("command", "") for h in existing}
-
-    added = 0
-    for hook in new_hook_entries:
-        # Check if already installed (match by command containing our script dir)
-        cmd = hook["command"]
-        if cmd not in existing_commands:
-            # Also check if an older version exists (same script name, different path)
-            script_name = os.path.basename(cmd.split()[-1])
-            replaced = False
-            for i, eh in enumerate(existing):
-                if script_name in eh.get("command", ""):
+    existing = groups[0].setdefault("hooks", [])
+    changed = 0
+    for hook in entries:
+        script_name = os.path.basename(hook["command"].split()[-1] if "index_hook" in hook["command"]
+                                       else hook["command"].split()[0])
+        for i, eh in enumerate(existing):
+            if script_name in eh.get("command", ""):
+                if eh != hook:
                     existing[i] = hook
-                    replaced = True
-                    break
-            if not replaced:
-                existing.append(hook)
-            added += 1
+                    changed += 1
+                break
+        else:
+            existing.append(hook)
+            changed += 1
+    print(f"  {event}: {'updated' if changed else 'already configured'}")
 
-    if added:
-        print(f"  {event}: {added} hook(s) installed")
-    else:
-        print(f"  {event}: already configured")
-
-with open(settings_file, "w") as f:
+tmp = settings_file + ".tmp"
+with open(tmp, "w") as f:
     json.dump(settings, f, indent=2)
     f.write("\n")
-
+os.replace(tmp, settings_file)
 print("  Settings saved")
 PYEOF
 
-# --- Install global MCP server (user scope) ---
+# --- Global MCP server (user scope) ---
 echo ""
 echo "Installing global MCP server..."
-
-# Create headersHelper script
 MCP_HELPERS_DIR="$HOME/.claude/mcp-helpers"
 mkdir -p "$MCP_HELPERS_DIR"
 cat > "$MCP_HELPERS_DIR/session-rag-headers.sh" << 'HELPEREOF'
 #!/bin/bash
-# Dynamic header helper for session-rag MCP server.
-# Outputs JSON with X-Project-Root set to the git repo root (or cwd).
-PROJECT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-echo "{\"X-Project-Root\": \"$PROJECT_ROOT\"}"
+# headersHelper for the session-rag MCP server: tells the server which project
+# this Claude Code session belongs to (git repo root, or the working directory).
+ROOT="${CLAUDE_PROJECT_DIR:-}"
+if [ -z "$ROOT" ]; then
+    ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+fi
+python3 -c 'import json, sys; print(json.dumps({"X-Project-Root": sys.argv[1]}))' "$ROOT" 2>/dev/null \
+    || printf '{"X-Project-Root": "%s"}\n' "$ROOT"
 HELPEREOF
 chmod +x "$MCP_HELPERS_DIR/session-rag-headers.sh"
 echo "  Header helper installed: $MCP_HELPERS_DIR/session-rag-headers.sh"
 
-# Add MCP server to ~/.claude.json (user scope)
 CLAUDE_JSON="$HOME/.claude.json"
-python3 << PYEOF
-import json
-import os
-
-claude_json = "$CLAUDE_JSON"
-helpers_dir = "$MCP_HELPERS_DIR"
-
+CLAUDE_JSON="$CLAUDE_JSON" MCP_HELPERS_DIR="$MCP_HELPERS_DIR" python3 - << 'PYEOF'
+import json, os
+claude_json = os.environ["CLAUDE_JSON"]
+helpers_dir = os.environ["MCP_HELPERS_DIR"]
+data = {}
 if os.path.exists(claude_json):
     with open(claude_json) as f:
         data = json.load(f)
-else:
-    data = {}
-
-servers = data.setdefault("mcpServers", {})
-servers["session-rag"] = {
+data.setdefault("mcpServers", {})["session-rag"] = {
     "type": "http",
     "url": "http://127.0.0.1:7102/mcp/",
     "headersHelper": f"{helpers_dir}/session-rag-headers.sh",
 }
-
-with open(claude_json, "w") as f:
+tmp = claude_json + ".tmp"
+with open(tmp, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
-
+os.replace(tmp, claude_json)
 print("  MCP server added to ~/.claude.json (user scope, all projects)")
 PYEOF
+
+# --- launchd agent (optional, recommended) ---
+echo ""
+LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${SESSION_RAG_LAUNCHD_LABEL:-com.mattgreen.session-rag}.plist"
+if [ -f "$LAUNCHD_PLIST" ] || [ "${SESSION_RAG_LAUNCHD:-}" = "1" ]; then
+    echo "Installing launchd agent (starts at login, restarts on crash)..."
+    "$SCRIPT_DIR/session-rag-server.sh" install-launchd
+else
+    echo "Tip: ./session-rag-server.sh install-launchd makes launchd start the server at login"
+    echo "     and keep it alive (recommended). Set SESSION_RAG_LAUNCHD=1 to do it from setup."
+fi
 
 # --- Done ---
 echo ""
 echo "======================================================================"
-echo "Installation Complete!"
+echo "Installation complete"
 echo "======================================================================"
 echo ""
-echo "Embedding model: $SESSION_RAG_MODEL (see rag_engine.py for details)"
+echo "Embedding model: $SESSION_RAG_MODEL   (./download-model.sh --list shows all options)"
+echo "Hooks: SessionStart (start server + register project), Stop and PreCompact (index)"
+echo "MCP server: ~/.claude.json (user scope, available in every project)"
 echo ""
-echo "Hooks installed in: ~/.claude/settings.json"
-echo "  - SessionStart: auto-start server + register file watcher + backfill"
-echo "  - Stop: index final turns when session ends"
-echo "  - PreCompact: index turns before context compaction"
-echo ""
-echo "MCP server installed globally in: ~/.claude.json"
-echo "  - Available in all projects automatically"
-echo "  - Dynamic project root via headersHelper"
-echo ""
-echo "Next step: Restart Claude Code to activate"
-echo ""
-echo "See README.md for full documentation."
+echo "Next step: restart Claude Code, or start the server now with ./session-rag-server.sh start"
 echo "======================================================================"

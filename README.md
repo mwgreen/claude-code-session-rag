@@ -1,278 +1,245 @@
 # session-rag
 
-Semantic search over Claude Code session transcripts. Recovers information lost to context compression — decisions, code snippets, error messages, and reasoning from past conversations.
+Semantic + keyword search over your Claude Code session transcripts. Recovers what
+context compaction throws away: decisions, code snippets, error messages, and the
+reasoning behind them, across every project on the machine.
 
-## How It Works
+## How it works
 
-Claude Code compresses older messages when conversations get long. Once compressed, the original content is lost. Session-rag indexes conversation turns into a vector database so Claude can search past discussions.
+- **Embedding model**: EmbeddingGemma-300M by default, run locally with MLX on Apple
+  Silicon. Qwen3-Embedding-0.6B is available as an alternative (see *Embedding models*).
+- **Vector store**: Milvus Lite, one global database at `~/.session-rag/milvus.db`.
+- **Keyword index**: SQLite FTS5 mirror of every chunk (BM25). Search is hybrid: both
+  engines run, results are merged with Reciprocal Rank Fusion.
+- **Indexing**: one sequential pipeline fed by a file watcher on `~/.claude/projects/`,
+  by the Stop/PreCompact hooks, and by a backfill on every session start.
+- **Server**: HTTP MCP server on `127.0.0.1:7102`. Started at login by a launchd agent
+  (recommended) or on demand by a SessionStart hook; a health watchdog restarts it if it
+  hangs.
+- **Memory**: about 600 MB for the model plus the index.
 
-- **Embedding model**: EmbeddingGemma-300M (default) or ModernBERT Embed Base, via `mlx-embeddings` on Apple Silicon
-- **Vector store**: Milvus Lite (global DB at `~/.session-rag/milvus.db`)
-- **Indexing**: File watcher (watchdog) monitors transcript files in real time, plus Stop/PreCompact hooks as backup
-- **Backfill**: On session start, automatically indexes any transcripts that were missed
-- **Server**: HTTP MCP server on port 7102
-- **Memory**: ~350-400 MB model footprint
-
-## Quick Start
-
-```bash
-# 1. Install (sets up venv, deps, model, hooks, AND global MCP server)
-./setup.sh
-
-# 2. Restart Claude Code to activate
-```
-
-Setup installs the MCP server globally (user scope in `~/.claude.json`) so it's available in every project automatically — no per-project `.mcp.json` needed.
-
-## MCP Tools
-
-| Tool | Description |
-|------|-------------|
-| `search_session` | Search conversation history with recency bias. Pass `session_id` to scope to current session. |
-| `search_all_sessions` | Cross-session search, pure semantic. Optional git branch filter. |
-| `get_turns` | Retrieve conversation turns around a specific turn index. |
-| `get_session_stats` | Index statistics: turn count, session count, branches. |
-| `cleanup_sessions` | Delete old session data by age, session ID, or git branch. |
-
-### Example Usage (from Claude Code)
-
-```
-search_session("what was the approval workflow decision")
-search_session("error message from the deploy script", session_id="abc123...")
-search_all_sessions("authentication architecture", git_branch="develop")
-cleanup_sessions(max_age_days=60)
-```
-
-## Installation
-
-### Prerequisites
-
-- macOS with Apple Silicon (M1/M2/M3/M4)
-- Python 3.12+
-- Claude Code CLI
-
-### Step 1: Run Setup
+## Quick start
 
 ```bash
-cd /path/to/claude-code-session-rag
-./setup.sh
+./setup.sh          # venv, dependencies, model download, hooks, global MCP entry
+# then restart Claude Code (or: ./session-rag-server.sh start)
 ```
 
-This creates a venv, installs dependencies (including watchdog), downloads the model, and installs hooks into `~/.claude/settings.json`.
+`setup.sh` is idempotent. Run it again after pulling changes to refresh hooks, the
+header helper and (if installed) the launchd agent.
 
-### Step 2: Restart Claude Code
-
-The setup script installs the MCP server globally and configures hooks automatically. Just restart Claude Code to activate.
-
-### How the Global MCP Config Works
-
-Setup adds the server to `~/.claude.json` at user scope with a `headersHelper` script that dynamically resolves the project root per session:
-
-```json
-{
-  "mcpServers": {
-    "session-rag": {
-      "type": "http",
-      "url": "http://127.0.0.1:7102/mcp/",
-      "headersHelper": "~/.claude/mcp-helpers/session-rag-headers.sh"
-    }
-  }
-}
+```bash
+./session-rag-server.sh install-launchd   # recommended: start at login, restart on crash
 ```
 
-The helper script (`~/.claude/mcp-helpers/session-rag-headers.sh`) runs at MCP connection time and outputs:
+## MCP tools
 
-```json
-{"X-Project-Root": "/path/to/current/git/repo"}
+| Tool | What it does |
+|------|--------------|
+| `search_session` | Hybrid search with a recency boost. Defaults to the current project; pass `session_id` (the `CLAUDE_SESSION_ID` env var) to stay inside the current session. |
+| `search_all_sessions` | Hybrid search without recency bias. Current project by default, `project_root="*"` for everything, optional `git_branch` filter. |
+| `get_turns` | The conversation around a hit (`session_id` + `turn_index` from a result; add `transcript_file` for subagent hits). |
+| `get_session_stats` | Chunk/session/branch counts for the current project, or all with `project_root="*"`. |
+| `cleanup_sessions` | Delete by age, session id or branch. |
+
+Every search result shows `score` (rank-fusion score; 1.0 = top of both engines, up to
+1.3 with the recency boost) and `sim` (cosine similarity, 1.0 = identical). Every response starts with a `Scope:` line
+so you can see which project filter was applied. If the current project has nothing
+indexed yet, the search widens to all projects and says so.
+
+## What gets indexed
+
+Each user prompt plus the assistant's text replies becomes one chunk:
+
+```
+User: <prompt>
+
+Assistant: <reply text>
+
+Actions:
+- Edit /path/to/file.py
+- Bash: pytest -q tests/
 ```
 
-This means the server automatically knows which project each Claude Code session belongs to, without any per-project configuration.
+- Tool calls are summarised into the `Actions` list (file paths, commands, search
+  patterns) so "which file did we change for X" is searchable. Tool *results*,
+  thinking blocks and file contents are not indexed.
+- Long turns are split into ~6000-character chunks that each repeat the prompt,
+  instead of being truncated.
+- Session titles and compaction summaries are indexed as `summary` chunks.
+- Subagent transcripts (`<session>/subagents/*.jsonl`) are indexed as `subagent`
+  chunks under the parent session id.
+- Slash-command echoes, local command output, task notifications and injected
+  `<system-reminder>` blocks are stripped and never indexed.
 
-### What setup.sh installs
-
-**Global MCP server** in `~/.claude.json` (user scope):
-- HTTP MCP server at `http://127.0.0.1:7102/mcp/`
-- `headersHelper` at `~/.claude/mcp-helpers/session-rag-headers.sh` for dynamic project root detection
-
-**Hooks** in `~/.claude/settings.json` (merged safely with existing hooks):
-
-| Hook | What it does |
-|------|-------------|
-| **SessionStart** | Starts the server + registers file watcher + backfills missed sessions |
-| **Stop** | Indexes final turns when session ends |
-| **PreCompact** | Indexes turns before context compaction |
+Transcripts are read incrementally by byte offset; only complete lines are consumed,
+so a line still being written is picked up on the next pass.
 
 ## Architecture
 
 ```
-Claude Code Session
-    │
-    ├── SessionStart hook ──► session-rag-server.sh start
-    │                     └──► session_start_hook.sh
-    │                           ├── sets $CLAUDE_SESSION_ID
-    │                           └── POST /watch (register watcher + backfill)
-    │
-    ├── [real-time] ────────── file_watcher.py (watchdog)
-    │                           watches ~/.claude/projects/{slug}/*.jsonl
-    │                           debounce 2s → parse new bytes → embed → index
-    │
-    ├── Stop hook ──────────► index_hook.py ──POST──► /index (final flush)
-    │
-    ├── PreCompact hook ────► index_hook.py ──POST──► /index
-    │
-    └── MCP tools ──────────────────────────────────► session-rag server
-                                                        │
-                                                        ├── transcript_parser.py
-                                                        │   (parse JSONL → turns)
-                                                        │
-                                                        ├── rag_engine.py
-                                                        │   (embed + Milvus)
-                                                        │
-                                                        └── ~/.session-rag/milvus.db
-                                                            (global vector DB)
+Claude Code session
+  ├─ SessionStart hook ─► session-rag-server.sh start   (idempotent, lock-protected)
+  │                    └► session_start_hook.sh ─► POST /watch  (register project, backfill)
+  ├─ Stop / PreCompact ─► index_hook.py ─► POST /index          (queue transcript now)
+  └─ MCP tools ─────────► http://127.0.0.1:7102/mcp/  (X-Project-Root header per session)
+
+session-rag server (http_server.py)
+  ├─ file_watcher.py   FSEvents on ~/.claude/projects/**.jsonl ─┐
+  ├─ indexer.py        single queue → parse new bytes → embed → insert
+  │                    (offsets in index_state.json, written atomically)
+  ├─ transcript_parser.py   JSONL → chunks
+  ├─ embedder.py            MLX models (EmbeddingGemma / Qwen3)
+  └─ rag_engine.py          Milvus Lite + FTS5, hybrid search, one worker thread
 ```
 
-### Indexing Pipeline
-
-1. **File watcher** (primary): watchdog monitors the transcript directory. When a `.jsonl` file is modified, the change is debounced (2s default) then the server reads from the last known byte offset to the end of file, parses new turns, and indexes them. Nothing is lost during debouncing — the byte offset ensures all content is captured.
-
-2. **Hook-based** (backup): Stop and PreCompact hooks POST to `/index` with the transcript path. Same incremental byte-offset logic. These serve as a safety net if the watcher misses something.
-
-3. **Backfill** (startup): On each SessionStart, the hook POSTs to `/watch` which scans all transcript files and indexes any that are behind their byte offset. This catches sessions missed due to server downtime.
-
-### What Gets Indexed
-
-- **User messages** with text content (not tool results)
-- **Assistant text responses** (not tool_use or thinking blocks)
-- **Compaction summaries** (session summary titles)
-
-### What Gets Skipped
-
-- Tool results, tool use blocks, thinking blocks
-- System messages, progress entries, file-history snapshots
-- Messages marked as `isMeta`
-
-### Incremental Indexing
-
-Each transcript is tracked by byte offset in `.session-rag/index_state.json`. Only new bytes since the last index are processed. The server owns this state file exclusively — no more race conditions from concurrent hook processes.
-
-### Auto-Expiry
-
-Turns older than 365 days are pruned automatically (checked once per day). Configure via the `SESSION_RAG_EXPIRE_DAYS` environment variable, or set to `0` to disable.
+All engine work (embedding, Milvus, SQLite) runs on one worker thread, which keeps the
+event loop responsive and avoids cross-thread SQLite use.
 
 ## Configuration
 
-Environment variables:
-
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SESSION_RAG_MODEL` | `embeddinggemma` | Embedding model: `embeddinggemma` or `modernbert` |
-| `SESSION_RAG_PORT` | `7102` | HTTP server port |
-| `SESSION_RAG_EXPIRE_DAYS` | `365` | Auto-prune turns older than this |
-| `SESSION_RAG_WATCH` | `true` | Enable/disable file watcher |
-| `SESSION_RAG_WATCH_DEBOUNCE` | `2.0` | Seconds to wait after last file change before indexing |
+| `SESSION_RAG_MODEL` | from `~/.session-rag/config.json`, else `embeddinggemma` | `embeddinggemma`, `qwen3`, `qwen3-4bit` or `modernbert` |
+| `SESSION_RAG_PORT` | `7102` | HTTP port |
+| `SESSION_RAG_EXPIRE_DAYS` | `365` | Auto-prune chunks older than this (`0` disables) |
+| `SESSION_RAG_WATCH` | `true` | Enable the file watcher |
+| `SESSION_RAG_WATCH_DEBOUNCE` | `2.0` | Seconds of quiet before a changed transcript is indexed |
+| `SESSION_RAG_LOG_LEVEL` | `INFO` | Server log level |
+| `SESSION_RAG_CA_BUNDLE` | | Extra CA certificate (PEM) for model downloads behind a TLS proxy. `NODE_EXTRA_CA_CERTS` is honoured too. |
 
-### Switching Models
+The model choice is normally stored in `~/.session-rag/config.json` (written by
+`cleanup.py migrate-model`), so the launchd agent, the hooks and the CLI always agree.
+The other variables are read from the server's environment: the launchd agent's plist
+(`install-launchd` regenerates it) or the shell that runs `session-rag-server.sh`.
 
-Two embedding models are supported:
+## Embedding models
 
-| Model | ID | Dims | Context | Notes |
-|-------|----|------|---------|-------|
-| `modernbert` | `nomic-ai/modernbert-embed-base` | 768 | 8192 tokens | Default. Well-tested. |
-| `embeddinggemma` | `mlx-community/embeddinggemma-300m-bf16` | 768 | 2048 tokens | Google's EmbeddingGemma-300M. |
+| Name | Model | Dims | Context | Notes |
+|------|-------|------|---------|-------|
+| `embeddinggemma` | `mlx-community/embeddinggemma-300m-bf16` | 768 | 2048 tokens | Default. Fastest; best measured retrieval on session data. |
+| `qwen3` | `mlx-community/Qwen3-Embedding-0.6B-8bit` | 1024 | 8192 tokens (32k max) | Long context, strong on code benchmarks, ~4x slower to index. |
+| `qwen3-4bit` | `mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ` | 1024 | 8192 tokens | Smaller/faster Qwen3, slight quality loss. |
+| `modernbert` | `nomic-ai/modernbert-embed-base` | 768 | 8192 tokens | Legacy option. |
 
-To switch models:
+EmbeddingGemma is a bidirectional encoder; `embedder.py` runs the reference forward pass
+(bidirectional attention, padding masked, sliding window on local layers) because the
+`mlx-embeddings` 0.0.5 implementation leaks padding tokens into batched embeddings.
+
+Measured on this machine's own index (6,476 chunks, 94 session-title queries, hit rate of
+a chunk from the right session):
+
+| Model | Hit@1 | Hit@5 | Hit@10 | Index speed |
+|-------|-------|-------|--------|-------------|
+| EmbeddingGemma | 0.76 | 0.90 | 0.95 | ~60 chunks/s |
+| Qwen3-Embedding-0.6B (8-bit) | 0.74 | 0.88 | 0.93 | ~14 chunks/s |
+
+### Switching models
+
+Vectors from different models are incompatible, so the index must be re-embedded. The
+FTS mirror holds the text of every chunk, so nothing is lost even for transcripts that
+Claude Code has since deleted:
 
 ```bash
-# 1. Download the new model
-SESSION_RAG_MODEL=embeddinggemma ./download-model.sh
+./download-model.sh qwen3                     # once
+./session-rag-server.sh stop
+./venv/bin/python cleanup.py migrate-model --to qwen3   # re-embeds and records the model in config.json
+./session-rag-server.sh start
+```
 
-# 2. Clear the existing index (vectors are incompatible across models)
-./venv/bin/python cleanup.py reset
+The server stamps `~/.session-rag/model_identity.json` and refuses to start if the
+configured model does not match the index.
 
-# 3. Restart the server with the new model
-export SESSION_RAG_MODEL=embeddinggemma
+## Data management
+
+Stop the server first; Milvus Lite allows one process per database.
+
+```bash
+./session-rag-server.sh stop
+./venv/bin/python cleanup.py list [--project /path]     # sessions
+./venv/bin/python cleanup.py stats [--project /path]    # counts, model
+./venv/bin/python cleanup.py expire --days 60           # delete old chunks
+./venv/bin/python cleanup.py delete --session <id>      # or --branch <name>
+./venv/bin/python cleanup.py prune-noise                # drop command-echo chunks from old indexes
+./venv/bin/python cleanup.py migrate-model --to qwen3   # re-embed with another model
+./venv/bin/python cleanup.py reindex                    # drop + re-read all transcripts on disk
+./venv/bin/python cleanup.py reset                      # delete everything
+./venv/bin/python cleanup.py models                     # list models / download state
+./session-rag-server.sh start
+```
+
+## Server management
+
+```bash
+./session-rag-server.sh start     # idempotent; safe from concurrent sessions
+./session-rag-server.sh stop      # stays stopped (unloads the launchd agent if installed)
+./session-rag-server.sh status    # health + indexer stats
 ./session-rag-server.sh restart
+./session-rag-server.sh logs      # tail -f the log
+./session-rag-server.sh install-launchd     # launchd owns the process: start at login, restart on exit
+./session-rag-server.sh uninstall-launchd
+curl http://127.0.0.1:7102/health # 200 when ready, 503 while starting
+curl http://127.0.0.1:7102/status
 ```
 
-The server stamps `~/.session-rag/model_identity.json` with the active model. If you change `SESSION_RAG_MODEL` without clearing the index, the server will refuse to start with a clear error message.
+With the launchd agent installed, `start`/`stop`/`restart` go through `launchctl`, so the
+hooks, the watchdog and launchd can never start competing server processes (which is
+what produced the "address already in use" / "Open local milvus failed" errors before).
 
-## Data Management
+Logs: `~/.session-rag/server.log` (rotated at 10 MB). PID: `~/.session-rag/server.pid`.
 
-### CLI Cleanup
+## Development
 
 ```bash
-# List all indexed sessions
-./venv/bin/python cleanup.py list /path/to/project
-
-# Delete turns older than 60 days
-./venv/bin/python cleanup.py expire /path/to/project --days 60
-
-# Delete a specific session
-./venv/bin/python cleanup.py delete /path/to/project --session abc123-...
-
-# Delete all turns from a branch
-./venv/bin/python cleanup.py delete /path/to/project --branch feature/old-branch
-
-# Full reset (drops everything)
-./venv/bin/python cleanup.py reset /path/to/project
-
-# Show stats
-./venv/bin/python cleanup.py stats /path/to/project
+./venv/bin/python -m unittest discover -s tests -v
 ```
 
-### MCP Cleanup Tool
-
-From within a Claude Code session:
-```
-cleanup_sessions(max_age_days=60)
-cleanup_sessions(git_branch="feature/old-branch")
-cleanup_sessions(session_id="abc123-...")
-```
-
-## Server Management
-
-```bash
-./session-rag-server.sh start    # Start (idempotent)
-./session-rag-server.sh stop     # Stop
-./session-rag-server.sh status   # Check if running
-./session-rag-server.sh restart  # Stop + start
-```
-
-Health check (includes watcher status):
-```bash
-curl http://127.0.0.1:7102/health
-```
-
-Logs: `~/.session-rag/server.log`
-PID: `~/.session-rag/server.pid`
-
-## File Structure
+## Files
 
 ```
-claude-code-session-rag/
-├── http_server.py          # HTTP MCP server (port 7102)
-├── file_watcher.py         # Watchdog-based transcript file watcher
-├── tools.py                # MCP tool definitions
-├── rag_engine.py           # Embedding (ModernBERT/EmbeddingGemma) + Milvus operations
-├── transcript_parser.py    # Parse JSONL transcripts into turns
-├── index_hook.py           # Hook entry point (stdin → POST)
-├── session_start_hook.sh   # SessionStart hook (env var + register watcher)
-├── cleanup.py              # CLI data management tool
-├── session-rag-server.sh   # Server lifecycle script
-├── setup.sh                # Installation script (installs hooks too)
-├── download-model.sh       # Model download helper
-├── requirements.txt        # Python dependencies
-└── README.md
+http_server.py          HTTP MCP server, /health /status /index /watch
+indexer.py              single indexing pipeline (queue, offsets, backfill, project roots)
+file_watcher.py         FSEvents → indexer
+transcript_parser.py    JSONL transcripts → chunks
+embedder.py             model registry + MLX embedding backends (+ download helper)
+rag_engine.py           Milvus Lite + FTS5 storage, hybrid search
+fts_hybrid.py           FTS5 sidecar, query building, RRF
+index_state.py          atomic JSON state (offsets, slug map)
+tools.py                MCP tool definitions
+cleanup.py              maintenance CLI
+index_hook.py           Stop/PreCompact hook
+session_start_hook.sh   SessionStart hook
+session-rag-server.sh   server lifecycle + watchdog
+download-model.sh       model download
+setup.sh                installer
+tests/                  unit tests
 ```
 
 Runtime files:
+
 ```
-~/.claude.json                      # Global MCP server config (user scope)
-~/.claude/settings.json             # Hooks (installed by setup.sh)
-~/.claude/mcp-helpers/session-rag-headers.sh  # Dynamic header helper
-~/.session-rag/server.pid           # Server PID
-~/.session-rag/server.log           # Server logs
-~/.session-rag/milvus.db            # Global vector DB
-~/.session-rag/index_state.json     # Indexing progress (byte offsets)
+~/.claude.json                                 global MCP server entry (user scope)
+~/.claude/settings.json                        hooks
+~/.claude/mcp-helpers/session-rag-headers.sh   sends X-Project-Root per session
+~/.session-rag/milvus.db                       vectors + metadata
+~/.session-rag/fts.db                          keyword index / text mirror
+~/.session-rag/index_state.json                per-transcript byte offsets
+~/.session-rag/slug_map.json                   project slug → root path
+~/.session-rag/model_identity.json             model the index was built with
+~/.session-rag/config.json                     model choice shared by server + CLI
+~/.session-rag/server.log, server.pid, watchdog.pid
+~/Library/LaunchAgents/com.mattgreen.session-rag.plist   launchd agent (optional)
 ```
+
+## Troubleshooting
+
+- **Model download fails with a certificate error** (corporate TLS proxy): point
+  `SESSION_RAG_CA_BUNDLE` at the proxy's CA PEM (or rely on `NODE_EXTRA_CA_CERTS`) and rerun
+  `./download-model.sh`.
+- **"Model mismatch" at startup**: `SESSION_RAG_MODEL` differs from the model the index was
+  built with. Run `cleanup.py migrate-model --to <model>` or unset the variable.
+- **"Open local milvus failed"**: another process holds the database (a second server,
+  or `cleanup.py`). `./session-rag-server.sh status` shows the owner.
+- **Results say "all projects (X has no indexed turns yet)"**: the project header did not
+  match anything indexed. Chunks are tagged with the git repo root of the session's
+  working directory; `search_all_sessions(project_root="*")` searches everything.

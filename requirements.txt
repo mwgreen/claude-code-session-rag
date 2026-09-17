@@ -1,9 +1,14 @@
-pymilvus[milvus-lite]>=2.6.0,!=2.6.10  # 2.6.10 breaks unix socket address for milvus-lite
-setuptools>=70.0,<82.0
-mlx>=0.30.0
-mlx-embeddings
-transformers<5.0
-mcp>=1.0.0,<2.0  # 2.x removed Server.list_tools() decorator used in tools.py
+# Milvus Lite (embedded vector DB). 2.6.10 breaks the unix-socket address; 3.x is untested here.
+pymilvus[milvus-lite]>=2.6.0,<3.0,!=2.6.10
+setuptools>=70.0,<82.0          # milvus-lite still imports pkg_resources
+# MLX embedding stack. mlx-embeddings 0.1.x requires transformers 5 + mlx-vlm; pin until validated.
+mlx>=0.30.0,<1.0
+mlx-lm>=0.28.0,<1.0
+mlx-embeddings==0.0.5
+transformers>=4.57,<5.0
+huggingface_hub>=0.25
+# MCP + HTTP server
+mcp>=1.10,<2.0
 starlette
 uvicorn
 httpx

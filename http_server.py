@@ -1,345 +1,275 @@
 #!/usr/bin/env python3
 """
-Persistent HTTP server for session-rag MCP system.
+Persistent HTTP server for session-rag.
 
-Runs as a long-lived process serving MCP via StreamableHTTP.
-Projects are identified by the X-Project-Root header in each request.
-All projects share a single global DB at ~/.session-rag/milvus.db.
+Serves MCP over StreamableHTTP (stateless, JSON responses) plus a few plain
+endpoints used by the hooks and the launcher script:
 
-Start: ./session-rag-server.sh
-Health: curl http://127.0.0.1:7102/health
+  GET  /health   200 when model + index are ready, 503 otherwise
+  GET  /status   indexer / watcher / engine details
+  POST /index    hook: index a transcript now  {"transcript_path", "session_id", "cwd"}
+  POST /watch    hook: register a project and backfill its transcripts
+
+Projects are identified by the X-Project-Root header. All projects share one
+index at ~/.session-rag/.
+
+Start with ./session-rag-server.sh (it also runs a watchdog).
 """
+
+from __future__ import annotations
 
 import asyncio
 import contextlib
 import json
 import logging
 import os
-import signal
 import sys
-import time
 import traceback
 from pathlib import Path
 
 import uvicorn
+from mcp.server import Server
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
-from mcp.server import Server
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-
-import rag_engine
-import transcript_parser
 import file_watcher
-from file_watcher import register_project, get_global_watcher
-from tools import register_tools, set_current_project_root
+import indexer as indexer_mod
+import rag_engine
+from index_state import STATE_DIR
+from tools import invalidate_scope_cache, register_tools, set_current_project_root
 
-logger = logging.getLogger("session-rag")
-
-
-# --- Configuration ---
+logging.basicConfig(
+    level=os.getenv("SESSION_RAG_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stderr,
+)
+for noisy in ("mcp", "httpx", "uvicorn.access"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+logger = logging.getLogger("session-rag.server")
 
 HOST = os.getenv("SESSION_RAG_HOST", "127.0.0.1")
 PORT = int(os.getenv("SESSION_RAG_PORT", "7102"))
 AUTO_EXPIRE_DAYS = int(os.getenv("SESSION_RAG_EXPIRE_DAYS", "365"))
-_EXPIRE_CHECK_INTERVAL = 86400  # Check once per day
+EXPIRE_CHECK_SECONDS = 3600
+DB_PATH = str(STATE_DIR / "milvus.db")
+PID_FILE = STATE_DIR / "server.pid"
 
-_SERVER_DIR = Path.home() / ".session-rag"
-PID_FILE = _SERVER_DIR / "server.pid"
-LOG_FILE = _SERVER_DIR / "server.log"
+_ready = {"model": False, "index": False, "error": None}
+_background: list = []
 
 
-# --- Project middleware ---
+def _header_project_root(scope_or_request) -> str:
+    headers = scope_or_request.get("headers", []) if isinstance(scope_or_request, dict) \
+        else scope_or_request.scope.get("headers", [])
+    for key, value in headers:
+        if key == b"x-project-root":
+            return value.decode("utf-8", "replace").strip().rstrip("/")
+    return ""
+
 
 class ProjectMiddleware:
-    """ASGI middleware that extracts X-Project-Root header and sets ContextVar."""
+    """Puts the X-Project-Root header into the tools' ContextVar."""
 
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            headers = dict(scope.get("headers", []))
-            project_root = headers.get(b"x-project-root", b"").decode("utf-8").strip()
-            set_current_project_root(project_root if project_root else None)
-
+            set_current_project_root(_header_project_root(scope) or None)
         try:
             await self.app(scope, receive, send)
         except Exception as exc:
             logger.error("ASGI handler error: %s\n%s", exc, traceback.format_exc())
             if scope["type"] == "http":
                 body = json.dumps({"error": "internal_server_error", "detail": str(exc)}).encode()
-                await send({"type": "http.response.start", "status": 500, "headers": [
-                    [b"content-type", b"application/json"],
-                    [b"content-length", str(len(body)).encode()],
-                ]})
-                await send({"type": "http.response.body", "body": body})
+                try:
+                    await send({"type": "http.response.start", "status": 500, "headers": [
+                        [b"content-type", b"application/json"],
+                        [b"content-length", str(len(body)).encode()],
+                    ]})
+                    await send({"type": "http.response.body", "body": body})
+                except Exception:
+                    pass  # response already started
 
 
-# --- Health endpoint ---
+# --- Plain endpoints ----------------------------------------------------------
 
-_model_loaded = False
-_server_mode_ready = False
-
-
-async def health(request: Request) -> JSONResponse:
-    watchers = file_watcher.get_watcher_status()
-    return JSONResponse({
-        "status": "ok",
+def _status_payload() -> dict:
+    idx = indexer_mod.get_indexer()
+    return {
+        "status": "ok" if _ready["model"] and _ready["index"] else "starting",
         "server": "session-rag",
         "port": PORT,
         "model_name": rag_engine.get_model_name(),
-        "model_loaded": _model_loaded,
-        "milvus": _server_mode_ready,
-        "watchers": {k: v for k, v in watchers.items()},
-    })
+        "model_id": rag_engine.model_spec().model_id,
+        "embed_dim": rag_engine.model_spec().dim,
+        "model_loaded": _ready["model"],
+        "milvus": _ready["index"],
+        "error": _ready["error"],
+        "indexer": idx.status() if idx else None,
+        "watcher": file_watcher.get_watcher_status(),
+    }
 
 
-# --- Index endpoint (called by hooks) ---
+async def health(request: Request) -> JSONResponse:
+    payload = _status_payload()
+    code = 200 if payload["status"] == "ok" else 503
+    return JSONResponse(payload, status_code=code)
+
+
+async def status(request: Request) -> JSONResponse:
+    return JSONResponse(_status_payload())
+
 
 async def index_endpoint(request: Request) -> JSONResponse:
-    """Index new turns from a transcript file.
-
-    Expected JSON body:
-        {
-            "transcript_path": "/path/to/session.jsonl",
-            "session_id": "uuid",
-            "cwd": "/path/to/project"   (optional, fallback for project root)
-        }
-
-    Project root comes from X-Project-Root header (preferred) or cwd in body.
-    """
+    """Hook entry point: queue a transcript for immediate indexing."""
     try:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    transcript_path = body.get("transcript_path", "")
-    session_id = body.get("session_id", "")
-
+    transcript_path = str(body.get("transcript_path") or "")
+    session_id = str(body.get("session_id") or "")
     if not transcript_path or not session_id:
-        return JSONResponse(
-            {"error": "transcript_path and session_id are required"},
-            status_code=400,
-        )
-
+        return JSONResponse({"error": "transcript_path and session_id are required"}, status_code=400)
     if not os.path.exists(transcript_path):
-        return JSONResponse(
-            {"error": f"Transcript not found: {transcript_path}"},
-            status_code=404,
-        )
+        return JSONResponse({"error": f"Transcript not found: {transcript_path}"}, status_code=404)
+    project_root = _header_project_root(request) or str(body.get("cwd") or "").rstrip("/")
+    idx = indexer_mod.get_indexer()
+    if idx is None:
+        return JSONResponse({"error": "indexer not running"}, status_code=503)
+    if project_root:
+        idx.register_project(project_root)
+        invalidate_scope_cache()
+    idx.enqueue(transcript_path, project_root=project_root, session_id=session_id, immediate=True)
+    return JSONResponse({"queued": True, "session_id": session_id, "project_root": project_root})
 
-    # Determine project root from header or body
-    headers = dict(request.scope.get("headers", []))
-    project_root = headers.get(b"x-project-root", b"").decode("utf-8").strip()
-    if not project_root:
-        project_root = body.get("cwd", "")
-    if not project_root:
-        return JSONResponse(
-            {"error": "Project root required (X-Project-Root header or cwd in body)"},
-            status_code=400,
-        )
-
-    db_path = str(Path.home() / ".session-rag" / "milvus.db")
-
-    # Register slug→root mapping for the global watcher
-    register_project(project_root)
-
-    # Load centralized incremental state
-    state = transcript_parser.load_index_state()
-    offset = transcript_parser.get_transcript_offset(state, transcript_path)
-
-    # Parse new turns
-    turns, new_offset = transcript_parser.parse_transcript(
-        transcript_path, session_id, start_offset=offset
-    )
-
-    if not turns:
-        # Update offset even if no turns (e.g., only tool_result messages)
-        transcript_parser.set_transcript_offset(
-            state, transcript_path, new_offset, project_root=project_root)
-        transcript_parser.save_index_state(state)
-        return JSONResponse({"indexed": 0, "message": "No new turns to index"})
-
-    # Inject project_root into each turn
-    for t in turns:
-        t["project_root"] = project_root
-
-    # Index turns
-    count = await rag_engine.add_turns_async(turns, db_path=db_path)
-
-    # Save state
-    transcript_parser.set_transcript_offset(
-        state, transcript_path, new_offset, project_root=project_root)
-    transcript_parser.save_index_state(state)
-
-    print(f"[index] Indexed {count} turns from {os.path.basename(transcript_path)} "
-          f"(session {session_id[:8]})", file=sys.stderr)
-
-    # Auto-expiry: prune old turns once per day
-    expired = 0
-    if AUTO_EXPIRE_DAYS > 0:
-        last_expire = state.get("last_expire_check", 0)
-        now = time.time()
-        if now - last_expire > _EXPIRE_CHECK_INTERVAL:
-            expired = rag_engine.delete_older_than(AUTO_EXPIRE_DAYS, db_path=db_path)
-            state["last_expire_check"] = now
-            transcript_parser.save_index_state(state)
-            if expired > 0:
-                print(f"[expire] Pruned {expired} turns older than {AUTO_EXPIRE_DAYS} days",
-                      file=sys.stderr)
-
-    return JSONResponse({"indexed": count, "expired": expired, "session_id": session_id})
-
-
-# --- Watch endpoint (register project + backfill) ---
 
 async def watch_endpoint(request: Request) -> JSONResponse:
-    """Register a project for file watching and trigger backfill.
-
-    Called by SessionStart hook to ensure the watcher is running and
-    any missed sessions are indexed.
-
-    Project root comes from X-Project-Root header or JSON body.
-    """
-    # Determine project root from header
-    headers = dict(request.scope.get("headers", []))
-    project_root = headers.get(b"x-project-root", b"").decode("utf-8").strip()
-
+    """Hook entry point: register the project and backfill its transcripts."""
+    project_root = _header_project_root(request)
     if not project_root:
         try:
             body = await request.json()
-            project_root = body.get("project_root", "") or body.get("cwd", "")
+            project_root = str(body.get("project_root") or body.get("cwd") or "").rstrip("/")
         except Exception:
             pass
-
     if not project_root:
-        return JSONResponse(
-            {"error": "Project root required (X-Project-Root header or project_root in body)"},
-            status_code=400,
-        )
-
-    # Register slug→root mapping
-    register_project(project_root)
-
-    # Trigger backfill for this project's slug dir
-    backfilled = 0
-    watcher = get_global_watcher()
-    if watcher is not None:
-        from file_watcher import _project_root_to_slug
-        slug = _project_root_to_slug(project_root)
-        backfilled = await watcher.backfill(slug_filter=slug)
-
-    # Auto-expiry check
-    expired = 0
-    if AUTO_EXPIRE_DAYS > 0:
-        db_path = str(Path.home() / ".session-rag" / "milvus.db")
-        state = transcript_parser.load_index_state()
-        last_expire = state.get("last_expire_check", 0)
-        now = time.time()
-        if now - last_expire > _EXPIRE_CHECK_INTERVAL:
-            expired = rag_engine.delete_older_than(AUTO_EXPIRE_DAYS, db_path=db_path)
-            state["last_expire_check"] = now
-            transcript_parser.save_index_state(state)
-            if expired > 0:
-                print(f"[expire] Pruned {expired} turns older than {AUTO_EXPIRE_DAYS} days",
-                      file=sys.stderr)
-
-    return JSONResponse({
-        "watching": project_root,
-        "backfilled": backfilled,
-        "expired": expired,
-    })
+        return JSONResponse({"error": "Project root required (X-Project-Root header or project_root in body)"},
+                            status_code=400)
+    idx = indexer_mod.get_indexer()
+    if idx is None:
+        return JSONResponse({"error": "indexer not running"}, status_code=503)
+    idx.register_project(project_root)
+    invalidate_scope_cache()
+    slug = idx.slug_map.slug_for(project_root)
+    queued = await idx.schedule_backfill(slug_filter=slug)
+    return JSONResponse({"watching": project_root, "backfill_queued": queued})
 
 
-# --- Lifespan ---
+# --- Background tasks -----------------------------------------------------------
+
+async def _expiry_loop():
+    while True:
+        try:
+            idx = indexer_mod.get_indexer()
+            if idx is not None:
+                deleted = await idx.expire_old(AUTO_EXPIRE_DAYS)
+                if deleted:
+                    invalidate_scope_cache()
+        except Exception as exc:
+            logger.warning("Expiry check failed: %s", exc)
+        await asyncio.sleep(EXPIRE_CHECK_SECONDS)
+
+
+async def _initial_backfill():
+    idx = indexer_mod.get_indexer()
+    if idx is not None:
+        await idx.schedule_backfill()
+
+
+# --- Lifespan ---------------------------------------------------------------------
 
 @contextlib.asynccontextmanager
 async def lifespan(app: Starlette):
-    """Server lifecycle: PID file, model preload, server mode init."""
-    _SERVER_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info("Starting (PID %d)", os.getpid())
 
+    try:
+        rag_engine.init_server_mode(db_path=DB_PATH)   # fails fast on a model/index mismatch
+        _ready["index"] = True
+    except Exception as exc:
+        _ready["error"] = str(exc)
+        logger.error("Index initialisation failed: %s", exc)
+        raise
+    # Only the process that owns the database claims the PID file.
     PID_FILE.write_text(str(os.getpid()))
-    print(f"[HTTP] PID {os.getpid()} written to {PID_FILE}", file=sys.stderr)
 
-    global _model_loaded, _server_mode_ready
-
-    # Pre-load embedding model
     try:
-        model_name = rag_engine.get_model_name()
-        print(f"[HTTP] Pre-loading {model_name} model...", file=sys.stderr)
-        rag_engine.get_model()
-        _model_loaded = True
-        print(f"[HTTP] {model_name} model loaded.", file=sys.stderr)
-    except Exception as e:
-        print(f"[HTTP] Warning: Could not pre-load model: {e}", file=sys.stderr)
+        logger.info("Loading embedding model %s ...", rag_engine.get_model_name())
+        await rag_engine.run(rag_engine.load_model)
+        _ready["model"] = True
+    except Exception as exc:
+        _ready["error"] = str(exc)
+        logger.error("Could not load embedding model: %s", exc)
+        raise
 
-    db_path = str(_SERVER_DIR / "milvus.db")
     try:
-        rag_engine.init_server_mode(db_path=db_path)
-        _server_mode_ready = True
-    except Exception as e:
-        print(f"[HTTP] Warning: Could not init server mode: {e}", file=sys.stderr)
+        n = await rag_engine.run(rag_engine.backfill_fts, DB_PATH)
+        if n:
+            logger.info("FTS backfill: %d records", n)
+    except Exception as exc:
+        logger.warning("FTS backfill failed: %s", exc)
 
-    # Backfill FTS from Milvus for any records indexed before FTS was added
-    try:
-        backfilled = rag_engine.backfill_fts(db_path=db_path)
-        if backfilled:
-            print(f"[HTTP] FTS backfill: {backfilled} records", file=sys.stderr)
-    except Exception as e:
-        print(f"[HTTP] Warning: FTS backfill failed: {e}", file=sys.stderr)
-
-    # Start global file watcher on ~/.claude/projects/
-    try:
-        watcher = await file_watcher.start_global_watcher(db_path)
-        if watcher:
-            # Full backfill across all projects in background
-            asyncio.create_task(watcher.backfill())
-    except Exception as e:
-        print(f"[HTTP] Warning: Global watcher start failed: {e}", file=sys.stderr)
+    idx = await indexer_mod.start_indexer(DB_PATH, file_watcher.DEBOUNCE_SECONDS)
+    file_watcher.start_watcher(idx)
+    _background.append(asyncio.create_task(_initial_backfill(), name="initial-backfill"))
+    if AUTO_EXPIRE_DAYS > 0:
+        _background.append(asyncio.create_task(_expiry_loop(), name="expiry"))
 
     async with session_manager.run():
-        print(f"[HTTP] Server ready on http://{HOST}:{PORT}", file=sys.stderr)
+        logger.info("Server ready on http://%s:%d (model=%s)", HOST, PORT, rag_engine.get_model_name())
         try:
             yield
         finally:
-            pass
+            logger.info("Shutting down ...")
 
-    await file_watcher.stop_global_watcher()
+    for task in _background:
+        task.cancel()
+    for task in _background:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+    file_watcher.stop_watcher()
+    await indexer_mod.stop_indexer()
     rag_engine.close_server_mode()
-    if PID_FILE.exists():
+    if PID_FILE.exists() and PID_FILE.read_text().strip() == str(os.getpid()):
         PID_FILE.unlink()
-    print("[HTTP] Server stopped.", file=sys.stderr)
+    logger.info("Server stopped.")
 
 
-# --- MCP server setup ---
+# --- MCP wiring ---------------------------------------------------------------------
 
 mcp_server = Server(
     "session-rag",
     instructions=(
-        "Session-RAG provides semantic search over Claude Code conversation history. "
-        "When using search_session, ALWAYS pass the session_id parameter using the "
-        "CLAUDE_SESSION_ID environment variable to filter results to the current session. "
-        "Auto-resolution of session ID is not supported via HTTP headers. "
-        "Use search_all_sessions when you need to search across all past conversations."
+        "Session-RAG provides hybrid semantic + keyword search over past Claude Code "
+        "conversations. Results default to the current project. To restrict "
+        "search_session to the current session, pass session_id from the "
+        "CLAUDE_SESSION_ID environment variable. Use search_all_sessions with "
+        "project_root='*' to search every project. Use get_turns to read the "
+        "conversation around a hit."
     ),
 )
 register_tools(mcp_server)
-
-session_manager = StreamableHTTPSessionManager(
-    app=mcp_server,
-    stateless=True,
-    json_response=True,
-)
-
-
-# --- Starlette app ---
+session_manager = StreamableHTTPSessionManager(app=mcp_server, stateless=True, json_response=True)
 
 app = Starlette(
     routes=[
         Route("/health", health, methods=["GET"]),
+        Route("/status", status, methods=["GET"]),
         Route("/index", index_endpoint, methods=["POST"]),
         Route("/watch", watch_endpoint, methods=["POST"]),
         Mount("/mcp", app=ProjectMiddleware(session_manager.handle_request)),
@@ -348,19 +278,5 @@ app = Starlette(
 )
 
 
-# --- Signal handling ---
-
-def _handle_signal(signum, frame):
-    print(f"[HTTP] Received signal {signum}, shutting down...", file=sys.stderr)
-    raise SystemExit(0)
-
-
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, _handle_signal)
-
-    uvicorn.run(
-        app,
-        host=HOST,
-        port=PORT,
-        log_level="warning",
-    )
+    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")

@@ -6,9 +6,9 @@ Reads hook input JSON from stdin, derives project root, and POSTs
 to the session-rag server to index new transcript turns.
 
 Exit codes:
-  0 = success (or server not running — silently skip)
+  0 = success (or server not running: silently skip)
   1 = error (logged but doesn't block Claude)
-  Never exits 2 — that would block Claude from stopping.
+  Never exits 2, which would block Claude from stopping.
 """
 
 import json
@@ -22,7 +22,10 @@ SERVER_URL = os.getenv("SESSION_RAG_URL", "http://127.0.0.1:7102")
 
 
 def get_project_root(cwd: str) -> str:
-    """Derive project root from cwd using git."""
+    """Derive project root from cwd using git (or CLAUDE_PROJECT_DIR when set)."""
+    env_root = os.getenv("CLAUDE_PROJECT_DIR", "").strip()
+    if env_root:
+        return env_root.rstrip("/")
     try:
         result = subprocess.run(
             ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
@@ -34,7 +37,7 @@ def get_project_root(cwd: str) -> str:
             return result.stdout.strip()
     except Exception:
         pass
-    return cwd
+    return cwd.rstrip("/")
 
 
 def main():
@@ -62,24 +65,17 @@ def main():
     if not project_root:
         sys.exit(0)
 
-    # Fire-and-forget POST to server.
-    # We don't wait for the response — indexing happens in the background.
-    # If it fails, byte offsets don't advance and the next call retries.
+    # The server only queues the file (it answers immediately), so a short
+    # timeout is enough. If the server is down nothing is lost: the file
+    # watcher and the next session's backfill pick the transcript up.
     try:
         with httpx.Client() as client:
             client.post(
                 f"{SERVER_URL}/index",
-                json={
-                    "transcript_path": transcript_path,
-                    "session_id": session_id,
-                    "cwd": cwd,
-                },
+                json={"transcript_path": transcript_path, "session_id": session_id, "cwd": cwd},
                 headers={"X-Project-Root": project_root},
-                timeout=1.0,  # Just enough to send the request
+                timeout=3.0,
             )
-    except (httpx.ConnectError, httpx.ReadTimeout):
-        # Server not running or still processing — either way, fine.
-        pass
     except Exception:
         pass
 

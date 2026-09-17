@@ -1,346 +1,358 @@
 """
-Parse Claude Code JSONL transcripts into conversation turns for indexing.
+Parse Claude Code JSONL transcripts into indexable chunks.
 
-Transcript format (one JSON object per line):
-- type: "user"     → user message (content is str or list of tool_result)
-- type: "assistant" → assistant message (content is list of text/tool_use/thinking blocks)
-- type: "summary"  → compaction summary (short title string)
-- type: "system", "file-history-snapshot", "progress", "queue-operation" → skip
+Transcript entries (one JSON object per line) that matter:
+  type "user"       - a prompt. `message.content` is a string (or a list of blocks;
+                      tool_result blocks are ignored, text blocks are kept).
+  type "assistant"  - `message.content` is a list of text / tool_use / thinking blocks.
+  type "summary"    - compaction summary (short title).
+  type "ai-title"   - the session title Claude Code generates.
+Everything else (system, attachment, progress, mode, ...) is skipped.
 
-Turn assembly:
-1. A user entry with plain string content starts a new turn
-2. Subsequent assistant text blocks are accumulated
-3. Combined: "User: {user_text}\\n\\nAssistant: {assistant_text}"
-4. Summary entries become standalone chunks
+Turn assembly: a user prompt opens a turn; following assistant text blocks are
+appended; tool_use blocks are summarised into an "Actions:" list (file paths,
+commands) so "which file did we change for X" is searchable. Long turns are
+split into several chunks that each repeat the user prompt, instead of being
+truncated.
 
-Incremental reading:
-- index_state.json tracks last_byte_offset per transcript file
-- On each invocation, seek to offset, read only new lines
+Noise: slash-command echoes, local command output, task notifications and
+injected <system-reminder> blocks are stripped; prompts that are only noise are
+not indexed.
+
+Incremental reading: the caller passes the byte offset it has indexed up to.
+Only complete lines (terminated by a newline) are consumed, so a line that is
+still being written is picked up on the next pass instead of being lost.
 """
+
+from __future__ import annotations
 
 import hashlib
 import json
 import os
-from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+MAX_CHUNK_CHARS = 6000
+USER_HEADER_CHARS = 1500
+MAX_CHUNKS_PER_TURN = 8
+MAX_ACTIONS_CHARS = 1200
+MIN_CHUNK_CHARS = 20
+
+_SKIP_TYPES = frozenset({
+    "file-history-snapshot", "progress", "system", "queue-operation", "mode",
+    "permission-mode", "atis-latch", "attachment", "last-prompt",
+})
+
+_NOISE_TAGS = (
+    "system-reminder", "command-name", "command-message", "command-args",
+    "local-command-stdout", "local-command-stderr", "local-command-caveat",
+    "task-notification", "bash-input", "bash-stdout", "bash-stderr",
+    "ide_opened_file", "ide_selection",
+)
+_TAG_ALT = "|".join(re.escape(t) for t in _NOISE_TAGS)
+_TAG_BLOCK_RE = re.compile(rf"<({_TAG_ALT})\b[^>]*>.*?</\1\s*>", re.S)
+_TAG_STRAY_RE = re.compile(rf"</?({_TAG_ALT})\b[^>]*>")
+_SENTINEL_RE = re.compile(r"^\s*<<[^<>]+>>\s*$")
+_MULTI_NL_RE = re.compile(r"\n{3,}")
+
+_PATH_TOOLS = frozenset({"Edit", "MultiEdit", "Write", "Read", "NotebookEdit"})
 
 
-def parse_transcript(
-    transcript_path: str,
-    session_id: str,
-    start_offset: int = 0,
-    max_turn_chars: int = 8000,
-) -> Tuple[List[Dict], int]:
-    """Parse a Claude Code JSONL transcript into indexable turns.
-
-    Args:
-        transcript_path: Path to the .jsonl file
-        session_id: Session UUID for this transcript
-        start_offset: Byte offset to resume reading from
-        max_turn_chars: Maximum characters per turn text (truncate longer)
-
-    Returns:
-        (turns, new_offset) where turns is a list of dicts ready for rag_engine.add_turns()
-        and new_offset is the byte position after the last line read.
-    """
-    turns = []
-    current_user_text = None
-    current_user_start_byte = 0
-    current_assistant_texts = []
-    current_timestamp = ""
-    current_git_branch = ""
-
-    file_size = os.path.getsize(transcript_path)
-    if start_offset >= file_size:
-        return [], file_size
-
-    transcript_file = os.path.basename(transcript_path)
-
-    with open(transcript_path, "r", encoding="utf-8") as f:
-        f.seek(start_offset)
-        current_offset = start_offset
-
-        for line in f:
-            line_bytes = len(line.encode("utf-8"))
-            current_offset += line_bytes
-
-            line = line.strip()
-            if not line:
-                continue
-
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            entry_type = entry.get("type", "")
-
-            # Track git branch from any entry that has it
-            entry_branch = entry.get("gitBranch", "")
-            if entry_branch:
-                current_git_branch = entry_branch
-
-            # Track timestamp from any entry that has it
-            entry_ts = entry.get("timestamp", "")
-            if entry_ts:
-                current_timestamp = entry_ts
-
-            # Skip non-conversation entries
-            if entry_type in ("file-history-snapshot", "progress", "system", "queue-operation"):
-                continue
-
-            # Handle summary entries (compaction summaries)
-            if entry_type == "summary":
-                # Flush any pending turn first
-                if current_user_text is not None:
-                    turn = _build_turn(
-                        current_user_text, current_assistant_texts,
-                        session_id, transcript_file,
-                        current_user_start_byte,
-                        current_timestamp, current_git_branch,
-                        max_turn_chars, "turn",
-                    )
-                    if turn:
-                        turns.append(turn)
-                    current_user_text = None
-                    current_assistant_texts = []
-
-                summary_text = entry.get("summary", "")
-                if summary_text:
-                    summary_full = f"Session Summary: {summary_text}"
-                    # Use current byte offset as turn_index for summaries
-                    summary_byte = current_offset - len(line.encode("utf-8")) if line else current_offset
-                    content_hash = hashlib.sha256(
-                        f"{summary_byte}:{summary_full}".encode()
-                    ).hexdigest()[:16]
-                    turns.append({
-                        "text": summary_full,
-                        "doc_id": f"{session_id}::{content_hash}",
-                        "session_id": session_id,
-                        "transcript_file": transcript_file,
-                        "turn_index": summary_byte,
-                        "timestamp": current_timestamp,
-                        "git_branch": current_git_branch,
-                        "chunk_type": "summary",
-                    })
-                continue
-
-            # Handle user messages
-            if entry_type == "user":
-                message = entry.get("message", {})
-                content = message.get("content", "")
-
-                # Skip tool_result messages (content is a list)
-                if isinstance(content, list):
-                    continue
-
-                # Skip isMeta messages
-                if entry.get("isMeta"):
-                    continue
-
-                # Skip empty content
-                if not isinstance(content, str) or not content.strip():
-                    continue
-
-                # Flush previous turn if we have one
-                if current_user_text is not None:
-                    turn = _build_turn(
-                        current_user_text, current_assistant_texts,
-                        session_id, transcript_file,
-                        current_user_start_byte,
-                        current_timestamp, current_git_branch,
-                        max_turn_chars, "turn",
-                    )
-                    if turn:
-                        turns.append(turn)
-
-                # Start new turn — record byte position for content-based doc_id
-                current_user_text = content.strip()
-                current_user_start_byte = current_offset - line_bytes
-                current_assistant_texts = []
-                continue
-
-            # Handle assistant messages
-            if entry_type == "assistant":
-                message = entry.get("message", {})
-                content = message.get("content", [])
-
-                if not isinstance(content, list):
-                    continue
-
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    if block.get("type") == "text":
-                        text = block.get("text", "").strip()
-                        if text:
-                            current_assistant_texts.append(text)
-
-        # Flush final pending turn
-        if current_user_text is not None:
-            turn = _build_turn(
-                current_user_text, current_assistant_texts,
-                session_id, transcript_file,
-                current_user_start_byte,
-                current_timestamp, current_git_branch,
-                max_turn_chars, "turn",
-            )
-            if turn:
-                turns.append(turn)
-
-    return turns, current_offset
+def clean_user_text(text: str) -> str:
+    """Strip Claude Code's injected/echoed markup from a user prompt."""
+    if not text:
+        return ""
+    cleaned = _TAG_BLOCK_RE.sub(" ", text)
+    cleaned = _TAG_STRAY_RE.sub(" ", cleaned)
+    if _SENTINEL_RE.match(cleaned):
+        return ""
+    cleaned = _MULTI_NL_RE.sub("\n\n", cleaned)
+    return cleaned.strip()
 
 
-def _build_turn(
-    user_text: str,
-    assistant_texts: List[str],
-    session_id: str,
-    transcript_file: str,
-    start_byte: int,
-    timestamp: str,
-    git_branch: str,
-    max_chars: int,
-    chunk_type: str,
-) -> Optional[Dict]:
-    """Build a turn dict from user + assistant text.
-
-    doc_id uses a content hash (SHA-256 of byte position + text) to guarantee
-    uniqueness across incremental parses. This avoids the turn_index reset bug
-    where subsequent parse batches would collide with earlier ones.
-
-    turn_index uses the byte offset where the user message starts. This is
-    naturally monotonic across incremental parses (later turns always have
-    higher byte offsets), making get_turns context browsing work correctly.
-    """
-    parts = [f"User: {user_text}"]
-    if assistant_texts:
-        combined_assistant = "\n\n".join(assistant_texts)
-        parts.append(f"Assistant: {combined_assistant}")
-
-    text = "\n\n".join(parts)
-
-    # Truncate if too long
-    if len(text) > max_chars:
-        text = text[:max_chars] + "\n\n[truncated]"
-
-    # Skip very short turns (likely just whitespace or newlines)
-    if len(text.strip()) < 20:
+def describe_tool_use(block: Dict) -> Optional[str]:
+    """One-line summary of a tool_use block, or None if it is not worth indexing."""
+    name = str(block.get("name") or "")
+    inp = block.get("input") or {}
+    if not isinstance(inp, dict):
+        inp = {}
+    if not name:
         return None
+    if name in _PATH_TOOLS:
+        path = inp.get("file_path") or inp.get("notebook_path") or ""
+        return f"{name} {path}".strip()
+    if name == "Bash":
+        cmd = " ".join(str(inp.get("command", "")).split())
+        return f"Bash: {cmd[:160]}" if cmd else None
+    if name in ("Grep", "Glob"):
+        return f"{name} {inp.get('pattern', '')}".strip()
+    if name in ("Agent", "Task"):
+        desc = str(inp.get("description") or "").strip()
+        return f"{name}: {desc[:160]}" if desc else name
+    if name == "Skill":
+        return f"Skill {inp.get('skill', '')}".strip()
+    if name == "WebFetch":
+        return f"WebFetch {inp.get('url', '')}".strip()
+    if name == "WebSearch":
+        return f"WebSearch {inp.get('query', '')}".strip()
+    if name in ("TodoWrite", "AskUserQuestion", "ToolSearch", "ExitPlanMode", "EnterPlanMode"):
+        return None
+    return name
 
-    # Content-addressed doc_id: hash of byte position + text.
-    # - Byte position ensures identical text at different positions gets unique IDs
-    # - Content ensures re-indexing the same position produces the same ID (idempotent)
-    content_hash = hashlib.sha256(
-        f"{start_byte}:{text}".encode()
-    ).hexdigest()[:16]
 
+def _format_actions(actions: List[str]) -> str:
+    if not actions:
+        return ""
+    seen = set()
+    unique: List[str] = []
+    for a in actions:
+        if a not in seen:
+            seen.add(a)
+            unique.append(a)
+    lines = []
+    used = len("Actions:\n")
+    for i, a in enumerate(unique):
+        line = f"- {a}"
+        if used + len(line) + 1 > MAX_ACTIONS_CHARS:
+            lines.append(f"- ... (+{len(unique) - i} more)")
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return "Actions:\n" + "\n".join(lines)
+
+
+def _split_text(text: str, budget: int) -> List[str]:
+    """Split on paragraph/line/word boundaries so pieces stay <= budget chars."""
+    pieces: List[str] = []
+    budget = max(200, budget)
+    while len(text) > budget:
+        lo = budget // 2
+        cut = text.rfind("\n\n", lo, budget)
+        if cut == -1:
+            cut = text.rfind("\n", lo, budget)
+        if cut == -1:
+            cut = text.rfind(" ", lo, budget)
+        if cut == -1:
+            cut = budget
+        pieces.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    if text:
+        pieces.append(text)
+    return pieces
+
+
+@dataclass
+class _PendingTurn:
+    user_text: str
+    start_byte: int
+    timestamp: str = ""
+    git_branch: str = ""
+    assistant_texts: List[str] = field(default_factory=list)
+    actions: List[str] = field(default_factory=list)
+
+
+def _make_chunk(text: str, session_id: str, transcript_file: str, turn_index: int,
+                timestamp: str, git_branch: str, chunk_type: str) -> Dict:
+    content_hash = hashlib.sha256(f"{turn_index}:{text}".encode("utf-8")).hexdigest()[:16]
     return {
         "text": text,
         "doc_id": f"{session_id}::{content_hash}",
         "session_id": session_id,
         "transcript_file": transcript_file,
-        "turn_index": start_byte,
+        "turn_index": turn_index,
         "timestamp": timestamp,
         "git_branch": git_branch,
         "chunk_type": chunk_type,
     }
 
 
-# --- Index state management ---
+def build_turn_chunks(pending: _PendingTurn, session_id: str, transcript_file: str,
+                      chunk_type: str, max_chunk_chars: int = MAX_CHUNK_CHARS) -> List[Dict]:
+    """Turn one user/assistant exchange into one or more chunks."""
+    user = pending.user_text.strip()
+    assistant = "\n\n".join(t for t in pending.assistant_texts if t).strip()
+    actions = _format_actions(pending.actions)
 
-_STATE_DIR = Path.home() / ".session-rag"
-_STATE_PATH = _STATE_DIR / "index_state.json"
-_migrated = False
+    parts = [f"User: {user}"]
+    if assistant:
+        parts.append(f"Assistant: {assistant}")
+    if actions:
+        parts.append(actions)
+    full = "\n\n".join(parts)
+    if len(full.strip()) < MIN_CHUNK_CHARS:
+        return []
+
+    common = dict(session_id=session_id, transcript_file=transcript_file,
+                  timestamp=pending.timestamp, git_branch=pending.git_branch,
+                  chunk_type=chunk_type)
+    if len(full) <= max_chunk_chars:
+        return [_make_chunk(full, turn_index=pending.start_byte, **common)]
+
+    # Long turn: every chunk repeats (the start of) the prompt for context.
+    header = f"User: {user[:USER_HEADER_CHARS]}" + (" …" if len(user) > USER_HEADER_CHARS else "")
+    body_parts = []
+    if len(user) > USER_HEADER_CHARS:
+        body_parts.append("User (continued): " + user[USER_HEADER_CHARS:])
+    if assistant:
+        body_parts.append(assistant)
+    if actions:
+        body_parts.append(actions)
+    body = "\n\n".join(body_parts)
+    budget = max_chunk_chars - len(header) - 40
+    pieces = _split_text(body, budget)
+    if len(pieces) > MAX_CHUNKS_PER_TURN:
+        pieces = pieces[:MAX_CHUNKS_PER_TURN]
+        pieces[-1] = pieces[-1][: max(0, budget - 20)] + "\n\n[truncated]"
+    n = len(pieces)
+    chunks = []
+    for i, piece in enumerate(pieces):
+        text = f"{header}\n\nAssistant (part {i + 1}/{n}): {piece}"
+        chunks.append(_make_chunk(text, turn_index=pending.start_byte + i, **common))
+    return chunks
 
 
-def _migrate_per_project_states(state: Dict):
-    """One-time migration: merge per-project index_state.json files into the global state."""
-    global _migrated
-    if _migrated:
-        return
-    _migrated = True
+@dataclass
+class ParseResult:
+    turns: List[Dict]
+    new_offset: int
+    cwd: Optional[str] = None
+    git_branch: str = ""
 
-    # Known per-project state locations
-    claude_projects = Path.home() / ".claude" / "projects"
-    if not claude_projects.is_dir():
-        return
 
-    # Scan for any .session-rag/index_state.json under common project roots
-    home = Path.home()
-    candidates = []
-    for idea_dir in [home / "IdeaProjects", home / "git-repos"]:
-        if idea_dir.is_dir():
-            for project_dir in idea_dir.iterdir():
-                state_file = project_dir / ".session-rag" / "index_state.json"
-                if state_file.exists():
-                    candidates.append((str(project_dir), state_file))
+def _user_text_from_content(content) -> str:
+    if isinstance(content, str):
+        return clean_user_text(content)
+    if isinstance(content, list):
+        texts = [b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        return clean_user_text("\n\n".join(t for t in texts if t))
+    return ""
 
-    if not candidates:
-        return
 
-    transcripts = state.setdefault("transcripts", {})
-    merged_count = 0
+def parse_transcript(
+    transcript_path: str,
+    session_id: str,
+    start_offset: int = 0,
+    max_chunk_chars: int = MAX_CHUNK_CHARS,
+    chunk_type: str = "turn",
+    include_actions: bool = True,
+) -> ParseResult:
+    """Parse new complete lines of a transcript starting at `start_offset`.
 
-    for project_root, state_file in candidates:
+    Returns the chunks plus the byte offset just past the last complete line.
+    `chunk_type` is "turn" for a session's main transcript and e.g. "subagent"
+    for nested subagent transcripts.
+    """
+    file_size = os.path.getsize(transcript_path)
+    if start_offset > file_size:
+        start_offset = 0  # file was truncated or rewritten
+    if start_offset >= file_size:
+        return ParseResult([], file_size)
+
+    with open(transcript_path, "rb") as f:
+        f.seek(start_offset)
+        data = f.read()
+
+    last_nl = data.rfind(b"\n")
+    if last_nl == -1:
+        return ParseResult([], start_offset)  # partial line still being written
+    data = data[: last_nl + 1]
+    new_offset = start_offset + last_nl + 1
+
+    transcript_file = os.path.basename(transcript_path)
+    turns: List[Dict] = []
+    seen_summaries: set = set()
+    pending: Optional[_PendingTurn] = None
+    timestamp = ""
+    git_branch = ""
+    cwd: Optional[str] = None
+
+    def flush():
+        nonlocal pending
+        if pending is not None:
+            turns.extend(build_turn_chunks(pending, session_id, transcript_file,
+                                           chunk_type, max_chunk_chars))
+            pending = None
+
+    pos = start_offset
+    for raw in data.split(b"\n"):
+        line_start = pos
+        pos += len(raw) + 1
+        if not raw.strip():
+            continue
         try:
-            with open(state_file) as f:
-                old_state = json.load(f)
-        except (json.JSONDecodeError, IOError):
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
             continue
 
-        old_transcripts = old_state.get("transcripts", {})
-        for tpath, tdata in old_transcripts.items():
-            if tpath not in transcripts:
-                # Add project_root to the migrated entry
-                entry = dict(tdata)
-                entry["project_root"] = project_root
-                transcripts[tpath] = entry
-                merged_count += 1
+        entry_type = entry.get("type", "")
+        if entry.get("gitBranch"):
+            git_branch = entry["gitBranch"]
+        if entry.get("timestamp"):
+            timestamp = entry["timestamp"]
+        if cwd is None and entry.get("cwd"):
+            cwd = entry["cwd"]
 
-        # Preserve the latest expire check
-        old_expire = old_state.get("last_expire_check", 0)
-        if old_expire > state.get("last_expire_check", 0):
-            state["last_expire_check"] = old_expire
+        if entry_type in _SKIP_TYPES:
+            continue
 
-    if merged_count:
-        import sys
-        print(f"[state] Migrated {merged_count} transcript entries from "
-              f"{len(candidates)} per-project states", file=sys.stderr)
+        if entry_type in ("summary", "ai-title"):
+            if entry_type == "summary":
+                flush()
+                title = str(entry.get("summary") or "").strip()
+                label = "Session Summary"
+            else:
+                title = str(entry.get("aiTitle") or "").strip()
+                label = "Session Title"
+            if title:
+                text = f"{label}: {title}"
+                key = hashlib.sha256(f"summary:{text}".encode("utf-8")).hexdigest()[:16]
+                doc_id = f"{session_id}::{key}"
+                if doc_id not in seen_summaries:
+                    seen_summaries.add(doc_id)
+                    chunk = _make_chunk(text, session_id, transcript_file, line_start,
+                                        timestamp, git_branch, "summary")
+                    chunk["doc_id"] = doc_id  # same title in the same session indexes once
+                    turns.append(chunk)
+            continue
 
+        if entry_type == "user":
+            if entry.get("isMeta"):
+                continue
+            message = entry.get("message") or {}
+            text = _user_text_from_content(message.get("content"))
+            if not text:
+                continue
+            flush()
+            pending = _PendingTurn(user_text=text, start_byte=line_start,
+                                   timestamp=timestamp, git_branch=git_branch)
+            continue
 
-def load_index_state() -> Dict:
-    """Load centralized index state from ~/.session-rag/index_state.json."""
-    state = {}
-    if _STATE_PATH.exists():
-        try:
-            with open(_STATE_PATH) as f:
-                state = json.load(f)
-        except (json.JSONDecodeError, IOError):
-            state = {}
+        if entry_type == "assistant":
+            if pending is None:
+                continue  # assistant text without a prompt (resumed mid-turn) is skipped
+            message = entry.get("message") or {}
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    text = str(block.get("text") or "").strip()
+                    if text:
+                        pending.assistant_texts.append(text)
+                elif btype == "tool_use" and include_actions:
+                    desc = describe_tool_use(block)
+                    if desc:
+                        pending.actions.append(desc)
+            # Keep the turn's timestamp at the latest assistant activity.
+            if timestamp:
+                pending.timestamp = timestamp
 
-    _migrate_per_project_states(state)
-    return state
-
-
-def save_index_state(state: Dict):
-    """Save centralized index state to ~/.session-rag/index_state.json."""
-    _STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with open(_STATE_PATH, "w") as f:
-        json.dump(state, f, indent=2)
-
-
-def get_transcript_offset(state: Dict, transcript_path: str) -> int:
-    """Get the last indexed byte offset for a transcript file."""
-    return state.get("transcripts", {}).get(transcript_path, {}).get("last_byte_offset", 0)
-
-
-def set_transcript_offset(state: Dict, transcript_path: str, offset: int,
-                          project_root: str = ""):
-    """Update the byte offset for a transcript file."""
-    if "transcripts" not in state:
-        state["transcripts"] = {}
-    if transcript_path not in state["transcripts"]:
-        state["transcripts"][transcript_path] = {}
-    state["transcripts"][transcript_path]["last_byte_offset"] = offset
-    if project_root:
-        state["transcripts"][transcript_path]["project_root"] = project_root
+    flush()
+    return ParseResult(turns, new_offset, cwd, git_branch)
