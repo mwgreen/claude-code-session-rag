@@ -116,7 +116,19 @@ class Classify(unittest.TestCase):
                          ("-Users-me-proj", "abc", "turn"))
         self.assertEqual(indexer.classify_transcript(f"{base}/-Users-me-proj/abc/subagents/agent-1.jsonl"),
                          ("-Users-me-proj", "abc", "subagent"))
+        self.assertEqual(indexer.classify_transcript(f"{base}/-Users-me-proj/archived-sessions/old.jsonl"),
+                         ("-Users-me-proj", "old", "turn"))
         self.assertEqual(indexer.classify_transcript("/tmp/elsewhere/xyz.jsonl"), (None, "xyz", "turn"))
+
+    def test_enqueue_normalises_symlinked_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real_dir = os.path.join(tmp, "real"); os.mkdir(real_dir)
+            link_dir = os.path.join(tmp, "link"); os.symlink(real_dir, link_dir)
+            real = os.path.join(real_dir, "s.jsonl"); open(real, "w").close()
+            idx = indexer.Indexer(os.path.join(tmp, "milvus.db"))
+            idx.enqueue(os.path.join(link_dir, "s.jsonl"))
+            idx.enqueue(real)
+            self.assertEqual(list(idx._live), [os.path.realpath(real)])
 
 
 if __name__ == "__main__":

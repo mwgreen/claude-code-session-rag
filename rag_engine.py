@@ -245,8 +245,23 @@ def _persistent_client(db_path: str) -> MilvusClient:
     return client
 
 
+def _ensure_loaded(client: MilvusClient) -> None:
+    """Milvus Lite 3.x opens an existing collection in the 'released' state, and every
+    search/query then fails with "call load() before search/get/query". Loading is
+    idempotent and instant for a FLAT index, so do it once per client."""
+    if getattr(client, "_session_rag_loaded", False):
+        return
+    try:
+        client.load_collection(COLLECTION_NAME)
+    except Exception as exc:
+        logger.warning("load_collection(%s) failed: %s", COLLECTION_NAME, exc)
+        return
+    client._session_rag_loaded = True
+
+
 def _ensure_collection(client: MilvusClient) -> None:
     if client.has_collection(COLLECTION_NAME):
+        _ensure_loaded(client)
         return
     logger.info("Creating collection %s (dim=%d)", COLLECTION_NAME, _spec.dim)
     schema = CollectionSchema(fields=[
@@ -265,6 +280,8 @@ def _ensure_collection(client: MilvusClient) -> None:
     index_params = client.prepare_index_params()
     index_params.add_index(field_name="vector", index_type="FLAT", metric_type="COSINE")
     client.create_collection(collection_name=COLLECTION_NAME, schema=schema, index_params=index_params)
+    client._session_rag_loaded = False   # a recreated collection (reembed_all, reindex) must be loaded again
+    _ensure_loaded(client)
 
 
 @contextmanager

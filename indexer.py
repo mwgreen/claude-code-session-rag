@@ -52,6 +52,8 @@ def classify_transcript(path: str) -> Tuple[Optional[str], str, str]:
     slug = parts[0]
     if len(parts) == 2:
         return slug, p.stem, "turn"
+    if len(parts) == 3 and parts[1] == "archived-sessions":
+        return slug, p.stem, "turn"          # <slug>/archived-sessions/<session>.jsonl is a main transcript
     return slug, parts[1], "subagent"
 
 
@@ -122,6 +124,10 @@ class Indexer:
         """Schedule a transcript for (re)indexing after the debounce window."""
         if not path.endswith(".jsonl"):
             return
+        # Hooks may report a transcript through a symlinked config dir
+        # (~/.claude-personal/projects -> ~/.claude/projects). Offsets are keyed by
+        # path, so normalise or the same file is parsed once per alias.
+        path = os.path.realpath(path)
         due = time.monotonic() + (0.0 if immediate else self.debounce_seconds)
         item = self._live.get(path)
         if item is None:
