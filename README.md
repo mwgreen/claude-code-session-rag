@@ -152,6 +152,44 @@ Claude Code has since deleted:
 The server stamps `~/.session-rag/model_identity.json` and refuses to start if the
 configured model does not match the index.
 
+## Linux / Amazon Bedrock backend
+
+MLX only exists on Apple Silicon. With `SESSION_RAG_BACKEND=bedrock` the
+embeddings come from Amazon Bedrock instead and MLX is never imported. The Mac
+default (`mlx`) is unchanged.
+
+| Setting | Default | Notes |
+|---|---|---|
+| `SESSION_RAG_BACKEND` | `mlx` | `mlx` or `bedrock` |
+| `SESSION_RAG_BEDROCK_EMBED_MODEL` | `us.cohere.embed-v4:0` (`bedrock-cohere-v4`) | or `amazon.titan-embed-text-v2:0` (`bedrock-titan-v2`); short names work too |
+| `SESSION_RAG_BEDROCK_EMBED_DIM` | `1024` | Cohere: 256/512/1024/1536. Titan: 256/512/1024. |
+| `AWS_REGION` | `us-west-2` | credentials from boto3's default chain |
+
+Cohere sends up to 96 texts per call (`input_type` `search_document` for
+turns, `search_query` for queries); Titan sends one text per call with up to
+`BEDROCK_EMBED_CONCURRENCY` (8) in flight. Throttling is retried with
+exponential backoff and jitter; over-long texts are truncated with a warning.
+The identity in `~/.session-rag/model_identity.json` now includes the backend
+and dimension: a server whose backend, model or dimension differs from the one
+that built a non-empty index refuses to start (use `cleanup.py migrate-model
+--to <name>` or `cleanup.py reset`). `/health` reports `backend`, `model_id`,
+`embed_dim` and `bedrock_usage`.
+
+```bash
+uv venv --python 3.12 venv && uv pip install --python venv/bin/python -r requirements-bedrock.txt
+cat > ~/.config/session-rag.env <<'ENV'
+SESSION_RAG_BACKEND=bedrock
+SESSION_RAG_BEDROCK_EMBED_MODEL=us.cohere.embed-v4:0
+AWS_REGION=us-west-2
+ENV
+loginctl enable-linger "$USER"
+./session-rag-server.sh install-systemd   # systemd --user unit, 127.0.0.1:7102 only
+```
+
+The hooks and the MCP entry are the same as on the Mac (see `setup.sh`), with
+this machine's paths. Tests: `venv/bin/python -m unittest discover -s tests`;
+`RUN_BEDROCK_IT=1` adds a real Bedrock call.
+
 ## Data management
 
 Stop the server first; Milvus Lite allows one process per database.

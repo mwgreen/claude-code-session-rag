@@ -47,7 +47,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     stream=sys.stderr,
 )
-for noisy in ("mcp", "httpx", "uvicorn.access"):
+# botocore logs request bodies (transcript text) at DEBUG; keep it at WARNING.
+for noisy in ("mcp", "httpx", "uvicorn.access", "botocore", "boto3"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 logger = logging.getLogger("session-rag.server")
 
@@ -104,6 +105,7 @@ def _status_payload() -> dict:
         "status": "ok" if _ready["model"] and _ready["index"] else "starting",
         "server": "session-rag",
         "port": PORT,
+        "backend": rag_engine.get_backend(),
         "model_name": rag_engine.get_model_name(),
         "model_id": rag_engine.model_spec().model_id,
         "embed_dim": rag_engine.model_spec().dim,
@@ -112,7 +114,15 @@ def _status_payload() -> dict:
         "error": _ready["error"],
         "indexer": idx.status() if idx else None,
         "watcher": file_watcher.get_watcher_status(),
+        **_bedrock_status(),
     }
+
+
+def _bedrock_status() -> dict:
+    if rag_engine.get_backend() != "bedrock":
+        return {}
+    import bedrock_backend
+    return {"bedrock_region": bedrock_backend.region(), "bedrock_usage": bedrock_backend.USAGE.snapshot()}
 
 
 async def health(request: Request) -> JSONResponse:
