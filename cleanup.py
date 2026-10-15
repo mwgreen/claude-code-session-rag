@@ -126,10 +126,16 @@ def cmd_migrate_model(args):
     print(f"Current index model: {identity.get('model_name', '?')} -> new model: {spec.name} ({spec.model_id})")
     n = rag_engine.reembed_all(progress=print, skip_noise=not args.keep_noise)
     embedder.write_config(model=spec.name)
-    env_model = os.environ.get("SESSION_RAG_MODEL")
+    env_var = "SESSION_RAG_MODEL"
+    env_model = os.environ.get(env_var)
+    if embedder.backend_of(spec) == "bedrock":
+        env_var = "SESSION_RAG_BEDROCK_EMBED_MODEL"
+        env_model = os.environ.get(env_var)
+        if env_model and embedder.get_spec().name == spec.name:
+            env_model = None
     print(f"\nMigration complete ({n} chunks). Model '{spec.name}' recorded in {embedder.CONFIG_PATH}.")
     if env_model and env_model.lower() != spec.name:
-        print(f"Note: SESSION_RAG_MODEL={env_model} is set in this shell and overrides the config file; "
+        print(f"Note: {env_var}={env_model} is set in this shell and overrides the config file; "
               f"unset it or set it to {spec.name}.")
     print("Start the server again: ./session-rag-server.sh start")
 
@@ -163,11 +169,11 @@ def cmd_reset(args):
 
 
 def cmd_models(args):
-    active = embedder.resolve_model_name()
+    active = embedder.get_spec().name
     identity = rag_engine.read_identity()
     source = ("SESSION_RAG_MODEL" if os.environ.get("SESSION_RAG_MODEL")
               else "config.json" if embedder.read_config().get("model") else "default")
-    for spec in embedder.REGISTRY.values():
+    for spec in embedder.available_models().values():
         flags = []
         if spec.name == active:
             flags.append(f"active ({source})")
@@ -191,7 +197,7 @@ def main():
     p = sub.add_parser("delete", help="Delete by session or branch"); p.add_argument("--session"); p.add_argument("--branch")
     sub.add_parser("prune-noise", help="Remove command-echo noise chunks")
     p = sub.add_parser("migrate-model", help="Re-embed the index with another model")
-    p.add_argument("--to", required=True, help=f"Target model: {', '.join(embedder.REGISTRY)}")
+    p.add_argument("--to", required=True, help=f"Target model: {', '.join(embedder.available_models())}")
     p.add_argument("--keep-noise", action="store_true", help="Keep noise chunks instead of dropping them")
     p = sub.add_parser("reindex", help="Drop the index and re-read all transcripts"); p.add_argument("--yes", "-y", action="store_true")
     p = sub.add_parser("reset", help="Delete all data"); p.add_argument("--yes", "-y", action="store_true")

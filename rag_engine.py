@@ -34,7 +34,7 @@ os.environ.setdefault("GLOG_minloglevel", "2")
 
 from pymilvus import CollectionSchema, DataType, FieldSchema, MilvusClient  # noqa: E402
 
-from embedder import Embedder, ModelSpec, get_spec  # noqa: E402
+from embedder import ModelSpec, backend_of, get_spec, make_embedder  # noqa: E402
 from fts_hybrid import FTSIndex, rrf_merge  # noqa: E402
 from index_state import STATE_DIR, atomic_write_json, read_json  # noqa: E402
 
@@ -63,7 +63,7 @@ NOISE_PREFIXES = ("User: <command-name>", "User: <local-command", "User: <system
 # --- Module state -------------------------------------------------------------
 
 _spec: ModelSpec = get_spec()
-_embedder = Embedder(_spec)
+_embedder = make_embedder(_spec)
 _fts = FTSIndex("turns_fts", FTS_METADATA)
 _clients: Dict[str, MilvusClient] = {}
 _server_mode = False
@@ -74,7 +74,7 @@ def use_model(name: Optional[str]) -> ModelSpec:
     """Switch the active embedding model (CLI use, before anything is loaded)."""
     global _spec, _embedder
     _spec = get_spec(name)
-    _embedder = Embedder(_spec)
+    _embedder = make_embedder(_spec)
     return _spec
 
 
@@ -178,16 +178,27 @@ def _collection_dim(client: MilvusClient) -> Optional[int]:
     return None
 
 
+def get_backend() -> str:
+    return backend_of(_spec)
+
+
 def _check_model_identity(db_path: str) -> None:
-    """Refuse to mix vectors from different models. Stamps the identity on first use."""
+    """Refuse to mix vectors from different models (backend, model or dimension).
+    Stamps the identity on first use. Identities written before the bedrock
+    backend existed have no "backend" key; they were all MLX."""
     stored = read_identity()
     stored_name = stored.get("model_name")
     stored_id = stored.get("model_id")
-    if stored_name and (stored_name != _spec.name or (stored_id and stored_id != _spec.model_id)):
+    stored_backend = stored.get("backend", "mlx")
+    stored_dim = stored.get("embed_dim")
+    if stored_name and (stored_name != _spec.name or (stored_id and stored_id != _spec.model_id)
+                        or stored_backend != get_backend() or (stored_dim and stored_dim != _spec.dim)):
         if count(db_path=db_path) > 0:
             raise RuntimeError(
-                f"Model mismatch: the index was built with '{stored_name}' ({stored_id or 'unknown id'}) "
-                f"but SESSION_RAG_MODEL is '{_spec.name}' ({_spec.model_id}). Stop the server and run "
+                f"Model mismatch: the index was built with {stored_backend} '{stored_name}' "
+                f"({stored_id or 'unknown id'}, {stored_dim or '?'}d) but this server embeds with "
+                f"{get_backend()} '{_spec.name}' ({_spec.model_id}, {_spec.dim}d). Vectors from different "
+                f"models cannot be mixed. Stop the server and run "
                 f"'python cleanup.py migrate-model --to {_spec.name}' to re-embed the existing index, "
                 f"or 'python cleanup.py reset' to start empty."
             )

@@ -1,5 +1,9 @@
 """
-Embedding backends for session-rag (Apple Silicon / MLX).
+Embedding backends for session-rag: MLX on Apple Silicon (default), or Amazon
+Bedrock with SESSION_RAG_BACKEND=bedrock (for machines without MLX, e.g. Linux):
+  SESSION_RAG_BEDROCK_EMBED_MODEL  us.cohere.embed-v4:0 (default) | amazon.titan-embed-text-v2:0
+  SESSION_RAG_BEDROCK_EMBED_DIM    output dimension (default 1024)
+With the bedrock backend nothing imports MLX.
 
 A small registry of supported models plus one `Embedder` class that hides the
 per-architecture differences (prompt formats, pooling, attention masks).
@@ -25,7 +29,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -45,7 +49,7 @@ class ModelSpec:
     model_id: str
     dim: int
     max_tokens: int
-    backend: str  # "gemma" | "qwen3" | "generic"
+    backend: str  # "gemma" | "qwen3" | "generic" (MLX architectures) | "bedrock"
     query_prefix: str = ""
     document_prefix: str = ""
     description: str = ""
@@ -55,6 +59,8 @@ class ModelSpec:
         return HF_CACHE / ("models--" + self.model_id.replace("/", "--"))
 
     def is_downloaded(self) -> bool:
+        if self.backend == "bedrock":
+            return True  # nothing to download
         snaps = self.cache_dir / "snapshots"
         if not snaps.is_dir():
             return False
@@ -112,6 +118,73 @@ REGISTRY: Dict[str, ModelSpec] = {
 DEFAULT_MODEL = "embeddinggemma"
 CONFIG_PATH = Path.home() / ".session-rag" / "config.json"
 
+# --- Bedrock ------------------------------------------------------------------
+
+BACKENDS = ("mlx", "bedrock")
+
+# Short names (used by cleanup.py and the index identity) for the Bedrock models.
+BEDROCK_REGISTRY: Dict[str, ModelSpec] = {
+    "bedrock-cohere-v4": ModelSpec(
+        name="bedrock-cohere-v4",
+        model_id="us.cohere.embed-v4:0",
+        dim=1024,
+        max_tokens=128_000,
+        backend="bedrock",
+        description="Cohere Embed v4 on Amazon Bedrock (us. inference profile). 96 texts per call.",
+    ),
+    "bedrock-titan-v2": ModelSpec(
+        name="bedrock-titan-v2",
+        model_id="amazon.titan-embed-text-v2:0",
+        dim=1024,
+        max_tokens=8192,
+        backend="bedrock",
+        description="Amazon Titan Text Embeddings V2 on Amazon Bedrock. One text per call.",
+    ),
+}
+DEFAULT_BEDROCK_MODEL = "bedrock-cohere-v4"
+
+
+def resolve_backend() -> str:
+    name = os.environ.get("SESSION_RAG_BACKEND", "").strip().lower() or "mlx"
+    if name not in BACKENDS:
+        raise ValueError(f"Unknown SESSION_RAG_BACKEND={name!r}. Choose from: {', '.join(BACKENDS)}")
+    return name
+
+
+def available_models() -> Dict[str, ModelSpec]:
+    """The registry for the active backend."""
+    return BEDROCK_REGISTRY if resolve_backend() == "bedrock" else REGISTRY
+
+
+def _bedrock_name_for(value: str) -> str:
+    """Accept a short name or a Bedrock model ID."""
+    import bedrock_backend
+    value = value.strip()
+    if value.lower() in BEDROCK_REGISTRY:
+        return value.lower()
+    bedrock_backend.check_model_id(value)  # rejects bare profile-only IDs with a hint
+    for spec in BEDROCK_REGISTRY.values():
+        if spec.model_id == value:
+            return spec.name
+    raise ValueError(f"Unknown Bedrock embedding model {value!r}. Valid options: "
+                     + ", ".join(f"{s.name} ({s.model_id})" for s in BEDROCK_REGISTRY.values()))
+
+
+def _bedrock_spec(name: Optional[str]) -> ModelSpec:
+    import bedrock_backend
+    if name:
+        key = _bedrock_name_for(name)
+    elif os.environ.get("SESSION_RAG_BEDROCK_EMBED_MODEL", "").strip():
+        key = _bedrock_name_for(os.environ["SESSION_RAG_BEDROCK_EMBED_MODEL"])
+    elif str(read_config().get("model", "")).lower() in BEDROCK_REGISTRY:
+        key = str(read_config()["model"]).lower()  # set by cleanup.py migrate-model
+    else:
+        key = DEFAULT_BEDROCK_MODEL
+    spec = BEDROCK_REGISTRY[key]
+    dim = bedrock_backend.resolve_embed_dim(spec.model_id,
+                                            os.environ.get("SESSION_RAG_BEDROCK_EMBED_DIM", "").strip() or None)
+    return replace(spec, dim=dim)
+
 
 def read_config() -> Dict:
     """~/.session-rag/config.json: settings shared by the server (however it is
@@ -151,7 +224,20 @@ def resolve_model_name(name: Optional[str] = None) -> str:
 
 
 def get_spec(name: Optional[str] = None) -> ModelSpec:
+    if resolve_backend() == "bedrock":
+        return _bedrock_spec(name)
     return REGISTRY[resolve_model_name(name)]
+
+
+def backend_of(spec: ModelSpec) -> str:
+    return "bedrock" if spec.backend == "bedrock" else "mlx"
+
+
+def make_embedder(spec: ModelSpec):
+    """Embedder for the spec's backend (same interface either way)."""
+    if spec.backend == "bedrock":
+        return BedrockEmbedderAdapter(spec)
+    return Embedder(spec)
 
 
 # --- Batching helpers -------------------------------------------------------
@@ -229,7 +315,8 @@ class Embedder:
         return self._embed([self.spec.query_prefix + text])[0]
 
     def identity(self) -> Dict:
-        return {"model_name": self.spec.name, "model_id": self.spec.model_id, "embed_dim": self.spec.dim}
+        return {"backend": "mlx", "model_name": self.spec.name, "model_id": self.spec.model_id,
+                "embed_dim": self.spec.dim}
 
     # -- internals --
     def _embed(self, texts: Sequence[str]) -> List[List[float]]:
@@ -322,6 +409,41 @@ class Embedder:
         return normalize_embeddings(pooled)
 
 
+class BedrockEmbedderAdapter:
+    """The Embedder interface on top of bedrock_backend.BedrockEmbedder."""
+
+    def __init__(self, spec: ModelSpec, client=None):
+        self.spec = spec
+        self._client = client
+        self._bedrock = None
+
+    @property
+    def loaded(self) -> bool:
+        return self._bedrock is not None
+
+    def load(self):
+        if self._bedrock is None:
+            import bedrock_backend
+            self._bedrock = bedrock_backend.BedrockEmbedder(self.spec.model_id, dim=self.spec.dim,
+                                                            client=self._client)
+            logger.info("Embedding with Bedrock %s (%d dims, region %s)", self.spec.model_id,
+                        self.spec.dim, bedrock_backend.region())
+
+    def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        self.load()
+        return self._bedrock.embed(list(texts), input_type="search_document")
+
+    def embed_query(self, text: str) -> List[float]:
+        self.load()
+        return self._bedrock.embed([text], input_type="search_query")[0]
+
+    def identity(self) -> Dict:
+        return {"backend": "bedrock", "model_name": self.spec.name, "model_id": self.spec.model_id,
+                "embed_dim": self.spec.dim}
+
+
 # --- Download support (setup time only) --------------------------------------
 
 def _build_ca_bundle() -> Optional[str]:
@@ -380,8 +502,8 @@ def _main(argv: List[str]) -> int:
     args = parser.parse_args(argv)
 
     if args.cmd == "list":
-        active = resolve_model_name()
-        for spec in REGISTRY.values():
+        active = get_spec().name
+        for spec in available_models().values():
             flag = "*" if spec.name == active else " "
             state = "downloaded" if spec.is_downloaded() else "not downloaded"
             print(f"{flag} {spec.name:<15} {spec.model_id:<45} {spec.dim}d  {state}\n"
@@ -392,7 +514,7 @@ def _main(argv: List[str]) -> int:
         return 0
     if args.cmd == "check":
         spec = get_spec(args.name)
-        emb = Embedder(spec)
+        emb = make_embedder(spec)
         vec = emb.embed_documents(["check"])[0]
         print(f"{spec.name}: OK ({len(vec)} dims)")
         return 0

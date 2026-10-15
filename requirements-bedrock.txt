@@ -1,0 +1,10 @@
+# session-rag dependencies for the Bedrock backend (SESSION_RAG_BACKEND=bedrock), e.g. on Linux.
+# Same as requirements.txt without the MLX stack, plus boto3.
+pymilvus[milvus-lite]>=2.6.0,<3.0,!=2.6.10
+setuptools>=70.0,<82.0          # milvus-lite still imports pkg_resources
+boto3>=1.35
+mcp>=1.10,<2.0
+starlette
+uvicorn
+httpx
+watchdog>=4.0.0
