@@ -68,6 +68,12 @@ RETRYABLE_ERROR_CODES = frozenset({
 })
 
 MAX_ATTEMPTS = int(os.getenv("BEDROCK_MAX_ATTEMPTS", "8"))
+# A batch of 96 code chunks embeds in a few seconds; a stuck socket should fail fast.
+READ_TIMEOUT = float(os.getenv("BEDROCK_READ_TIMEOUT", "60"))
+# Wall-clock time that passed while the monotonic clock stood still (the machine
+# slept or hibernated). Pooled connections do not survive that: the first request
+# on one would hang until READ_TIMEOUT, so the client is replaced instead.
+SUSPEND_GAP_SECONDS = 30.0
 BACKOFF_BASE = 0.5     # seconds
 BACKOFF_CAP = 20.0     # seconds
 SLOW_CALL_SECONDS = 5.0
@@ -75,6 +81,8 @@ SLOW_CALL_SECONDS = 5.0
 # Patchable in tests.
 _sleep: Callable[[float], None] = time.sleep
 _random: Callable[[], float] = random.random
+_wall: Callable[[], float] = time.time
+_mono: Callable[[], float] = time.monotonic
 
 
 def check_model_id(model_id: str) -> str:
@@ -103,11 +111,40 @@ def make_client(max_pool_connections: int = 16):
         region_name=region(),
         config=Config(
             retries={"max_attempts": 1, "mode": "standard"},
-            connect_timeout=10,
-            read_timeout=120,
+            connect_timeout=5,
+            read_timeout=READ_TIMEOUT,
+            tcp_keepalive=True,
             max_pool_connections=max_pool_connections,
         ),
     )
+
+
+class _ClientOwner:
+    """Lazily created bedrock-runtime client, replaced after the machine resumes
+    from sleep or hibernation (detected as a jump between the wall clock and the
+    monotonic clock, which does not advance while suspended)."""
+
+    _pool_size = 16
+
+    def _init_client(self, client) -> None:
+        self._client = client
+        self._owns_client = client is None   # an injected client is never replaced
+        self._client_lock = threading.Lock()
+        self._stamp: Optional[tuple] = None
+
+    @property
+    def client(self):
+        with self._client_lock:
+            wall, mono = _wall(), _mono()
+            if self._owns_client and self._client is not None and self._stamp is not None:
+                suspended = (wall - self._stamp[0]) - (mono - self._stamp[1])
+                if suspended > SUSPEND_GAP_SECONDS:
+                    logger.info("Resumed after ~%.0fs suspended; reconnecting to Bedrock", suspended)
+                    self._client = None
+            if self._client is None:
+                self._client = make_client(max_pool_connections=self._pool_size)
+            self._stamp = (wall, mono)
+            return self._client
 
 
 # --- Usage accounting -------------------------------------------------------
@@ -199,7 +236,7 @@ def resolve_embed_dim(model_id: str, requested: Optional[str | int] = None) -> i
     return dim
 
 
-class BedrockEmbedder:
+class BedrockEmbedder(_ClientOwner):
     """Embeds texts with a Bedrock model.
 
     input_type is "search_document" when indexing and "search_query" for
@@ -215,17 +252,9 @@ class BedrockEmbedder:
         self.max_batch = self.spec["max_batch"]
         self.max_chars = int(max_chars or self.spec["max_chars"])
         self.concurrency = max(1, int(concurrency or os.getenv("BEDROCK_EMBED_CONCURRENCY", "8")))
-        self._client = client
-        self._client_lock = threading.Lock()
+        self._pool_size = max(16, self.concurrency * 2)
+        self._init_client(client)
         self._pool: Optional[ThreadPoolExecutor] = None
-
-    @property
-    def client(self):
-        if self._client is None:
-            with self._client_lock:
-                if self._client is None:
-                    self._client = make_client(max_pool_connections=max(16, self.concurrency * 2))
-        return self._client
 
     def identity(self) -> Dict:
         return {"backend": "bedrock", "embed_model": self.model_id, "embed_dim": self.dim}
@@ -312,23 +341,14 @@ class BedrockEmbedder:
 
 # --- Text generation (Converse) ----------------------------------------------
 
-class BedrockGenerator:
+class BedrockGenerator(_ClientOwner):
     """Single-turn text generation through the Converse API."""
 
     def __init__(self, model_id: str, client=None, max_tokens: int = 80, temperature: float = 0.0):
         self.model_id = check_model_id(model_id)
         self.max_tokens = max_tokens
         self.temperature = temperature
-        self._client = client
-        self._client_lock = threading.Lock()
-
-    @property
-    def client(self):
-        if self._client is None:
-            with self._client_lock:
-                if self._client is None:
-                    self._client = make_client()
-        return self._client
+        self._init_client(client)
 
     def generate(self, prompt: str) -> str:
         def call():
