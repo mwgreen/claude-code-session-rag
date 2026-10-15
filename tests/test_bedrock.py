@@ -145,6 +145,26 @@ class AdapterTests(EnvCase):
 
 
 @unittest.skipUnless(HAVE_BOTO, "boto3 not installed")
+class ResumeTests(EnvCase):
+    def test_client_replaced_after_hibernation(self):
+        clock = {"wall": 1000.0, "mono": 10.0}
+        made = []
+        saved = (bb._wall, bb._mono, bb.make_client)
+        bb._wall, bb._mono = (lambda: clock["wall"]), (lambda: clock["mono"])
+        bb.make_client = lambda max_pool_connections=16: made.append(StubBedrock()) or made[-1]
+        try:
+            os.environ["SESSION_RAG_BACKEND"] = "bedrock"
+            emb = embedder.make_embedder(embedder.get_spec())
+            emb.embed_query("before")
+            clock["wall"] += 8 * 3600            # hibernated: monotonic clock stood still
+            clock["mono"] += 1
+            emb.embed_query("after")
+            self.assertEqual([len(m.invocations) for m in made], [1, 1])
+        finally:
+            bb._wall, bb._mono, bb.make_client = saved
+
+
+@unittest.skipUnless(HAVE_BOTO, "boto3 not installed")
 class IdentityTests(EnvCase):
     def setUp(self):
         super().setUp()
